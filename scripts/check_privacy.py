@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+import zlib
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,8 @@ FORBIDDEN_SUFFIXES = {".apk", ".apkm", ".apks", ".xapk", ".ipa", ".dmg", ".jar",
 ALLOWED_SUFFIXES = {".py", ".sh", ".md", ".json", ".txt", ".patch", ".diff", ".yml", ".yaml"}
 ALLOWED_NAMES = {".gitignore", ".gitattributes", "instagram-on-mac", "LICENSE"}
 PUBLIC_COVER = "assets/cover.svg"
+PUBLIC_PNG_COVER = "assets/cover.png"
+PUBLIC_PNG_SHA256 = "cb966fe316de69c76a4afa0a17248159a7afec9779b9c461ac2d5179119a80b0"
 PUBLIC_REPOSITORY = "https://github.com/surajmandalcell/instagramOnMac"
 PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----"),
@@ -47,7 +51,46 @@ def personal_markers() -> set[str]:
     return markers
 
 
+def valid_cover_png(data: bytes) -> bool:
+    """Accept a complete RGB PNG with image chunks only, including valid CRCs."""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset, seen_header, seen_data = 8, False, False
+    while offset + 12 <= len(data):
+        size = int.from_bytes(data[offset:offset + 4], "big")
+        end = offset + 12 + size
+        if end > len(data):
+            return False
+        kind = data[offset + 4:offset + 8]
+        payload = data[offset + 8:offset + 8 + size]
+        crc = int.from_bytes(data[end - 4:end], "big")
+        if zlib.crc32(kind + payload) != crc:
+            return False
+        if kind == b"IHDR":
+            if seen_header or offset != 8 or size != 13:
+                return False
+            if not int.from_bytes(payload[:4], "big") or not int.from_bytes(payload[4:8], "big"):
+                return False
+            if payload[8:12] != b"\x08\x02\x00\x00" or payload[12] not in (0, 1):
+                return False
+            seen_header = True
+        elif kind == b"IDAT":
+            if not seen_header or not size:
+                return False
+            seen_data = True
+        elif kind == b"IEND":
+            return seen_header and seen_data and size == 0 and end == len(data)
+        else:
+            return False
+        offset = end
+    return False
+
+
 def inspect_file(path: str, data: bytes, markers: set[str]) -> list[str]:
+    if path == PUBLIC_PNG_COVER:
+        if hashlib.sha256(data).hexdigest() != PUBLIC_PNG_SHA256 or not valid_cover_png(data):
+            return ["cover must match the approved metadata-free RGB PNG"]
+        return []
     relative = Path(path)
     errors = []
     if path != PUBLIC_COVER and relative.name not in ALLOWED_NAMES and relative.suffix.lower() not in ALLOWED_SUFFIXES:
@@ -138,7 +181,7 @@ def main() -> int:
         print(f"FAIL {name}: {label}")
     if failures:
         return 1
-    print(f"PASS: {len(paths)} text files; no detected private data or generated payloads")
+    print(f"PASS: {len(paths)} files; no detected private data or generated payloads")
     return 0
 
 

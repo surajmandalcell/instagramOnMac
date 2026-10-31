@@ -1,6 +1,6 @@
 # Instagram on Mac
 
-![Instagram on Mac](assets/cover.svg)
+![Instagram on Mac](assets/cover.png)
 
 ## For humans
 

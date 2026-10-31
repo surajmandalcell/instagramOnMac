@@ -2,6 +2,8 @@
 
 This repository contains a source recipe, compatibility patches, public dependency pins, documentation, and synthetic tests. It does not accept app binaries, Instagram packages, account data, media, logs, screenshots, signing keys, personal paths, or local account identifiers.
 
+The approved cover at `assets/cover.png` is the sole raster artwork exception. Its exact SHA-256 and metadata restrictions are enforced by the privacy check. Do not add screenshots or other images.
+
 ## Supported target
 
 Keep changes gated to the tested Apple Silicon and macOS 26.4+ setup, Mac.apk 1.0.2303, and Instagram 445.0.0.45.83. Treat other package versions as unsupported until their compatibility is tested and the source pin is reviewed.

@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("privacy", Path(__file__).resolve().parents[1] / "scripts/check_privacy.py")
@@ -15,6 +16,35 @@ spec.loader.exec_module(privacy)
 
 
 class PrivacyTests(unittest.TestCase):
+    def test_only_exact_approved_png_cover_is_allowed(self):
+        data = (privacy.ROOT / privacy.PUBLIC_PNG_COVER).read_bytes()
+        self.assertFalse(privacy.inspect_file(privacy.PUBLIC_PNG_COVER, data, set()))
+        self.assertTrue(privacy.inspect_file("assets/screenshot.png", data, set()))
+        self.assertTrue(privacy.inspect_file(privacy.PUBLIC_PNG_COVER, data[:-1] + bytes([data[-1] ^ 1]), set()))
+
+    def test_png_structure_rejects_metadata_truncation_and_trailing_data(self):
+        def chunk(kind, payload):
+            return (len(payload).to_bytes(4, "big") + kind + payload
+                    + zlib.crc32(kind + payload).to_bytes(4, "big"))
+
+        signature = b"\x89PNG\r\n\x1a\n"
+        header = chunk(b"IHDR", b"\x00\x00\x00\x01" * 2 + b"\x08\x02\x00\x00\x00")
+        pixels = chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+        end = chunk(b"IEND", b"")
+        valid = signature + header + pixels + end
+        self.assertTrue(privacy.valid_cover_png(valid))
+        for data in (
+            valid + b"trailing",
+            valid[:-1],
+            signature + header + chunk(b"tEXt", b"private metadata") + pixels + end,
+            signature + pixels + header + end,
+            signature + header + header + pixels + end,
+            signature + header + end,
+            signature + header + b"\xff\xff\xff\xffIDAT",
+            valid[:-5] + bytes([valid[-5] ^ 1]) + valid[-4:],
+        ):
+            self.assertFalse(privacy.valid_cover_png(data))
+
     def test_only_the_public_destination_is_exempt_from_personal_markers(self):
         account = privacy.PUBLIC_REPOSITORY.split("/")[-2]
         self.assertFalse(privacy.inspect_file("README.md", (privacy.PUBLIC_REPOSITORY + "/releases").encode(), {account}))
