@@ -6,6 +6,7 @@
 - Publish a source-only experimental release with a reproducible setup, clear limitations, and approved cover art. Never publish personal screenshots or account media.
 - Use C2 / Editorial Serif as the final cover: a large pink camera, thin window rule without traffic lights, large serif Instagram title, and smaller on Mac text. Align both footer lines with the title's visible I left edge and the end of on Mac with its final m right edge. Preserve the approved style and remove image metadata. The only approved raster asset is assets/cover.png, pinned by the privacy check.
 - Cover footer copy: "Instagram APK, running natively on Mac." then "Built for browsing and posting." Remove Experimental from the cover. Keep the README's known limitations visible. Name its two instruction sections "Instructions for Humans" and "Instructions for Agents".
+- Keep the README brief: four feature bullets, one agent install prompt, one known-issue note, and collapsed terminal and agent details. Do not show an Experimental label in README copy.
 - Download Mac.apk from its official GitHub release. Pin the tested source commit and download checksums. Retain upstream license notices.
 - Fetch, patch, build, install, check for updates, and update through one command-line entry point.
 - Fail before changing installed apps if a new release is unsupported, a checksum fails, a patch does not apply, a build fails, or signing fails.

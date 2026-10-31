@@ -2,31 +2,25 @@
 
 ![Instagram on Mac](assets/cover.png)
 
-**Instagram APK, running natively on Mac.**
-
-Built for browsing and posting.
+Instagram APK, running natively on Mac. Built for browsing and posting.
 
 ## Instructions for Humans
 
-Run Instagram's Android app on an Apple Silicon Mac with [Mac.apk](https://github.com/kksimp/Mac.apk). Build it locally with this recipe. No Android virtual machine is needed.
+- Home, Back, options, and volume controls.
+- Browse your own images and videos. No Photos scanning; originals stay read-only.
+- Convert MOV once and reuse the cached MP4.
+- Update the runtime while keeping your app data.
 
-- **Desktop controls:** Home, Back, options, and volume in the title bar.
-- **Browse your files:** choose images and videos from the Mac file picker.
-- **Selected files only:** no Photos or folder scanning.
-- **Keep originals safe:** selected files are opened read-only.
-- **MOV support:** convert once to a separate MP4 and reuse it.
-- **Keep app data:** runtime updates preserve the installed app's data.
-- **Build it yourself:** pinned source and patches; no APK or app binary is distributed.
+You need Apple Silicon, macOS 26.4+, an external drive, and a local code-signing certificate. Supply a trusted Instagram **445.0.0.45.83** package.
 
-**Experimental prerelease:** Video preview after **Next** can be blank and use high CPU. Posting is not verified. Camera, video-selfie verification, and other Instagram screens are not guaranteed.
+**Install with your coding agent:**
 
-**You need:** macOS 26.4+, Apple Silicon, an external drive, and a local code-signing certificate with its private key. Bring your own trusted Instagram **445.0.0.45.83** package.
+> Install https://github.com/surajmandalcell/instagramOnMac using Instructions for Agents. Keep my app data safe and do not publish test posts.
 
-**Easiest with an AI coding agent:** give it the repository link and this prompt:
+<details>
+<summary>Install from the terminal</summary>
 
-> Set up Instagram on Mac from https://github.com/surajmandalcell/instagramOnMac. Follow the Instructions for Agents section. Explain any missing prerequisite in simple terms. Keep my existing app data and do not publish test posts.
-
-**Prefer the terminal?** Install Xcode Command Line Tools first. Replace `/Volumes/Data` below with your external drive:
+Install Xcode Command Line Tools first. Replace `/Volumes/Data` with your external drive:
 
 ```sh
 brew install cmake openjdk@21 capstone libpng libvpx python
@@ -38,9 +32,18 @@ export INSTAGRAM_ON_MAC_CACHE="/Volumes/Data/instagram-on-mac-build"
 
 Set `MACAPK_SIGN_IDENTITY` to your certificate name if you have no existing Mac.apk install. Keep the same certificate for updates.
 
-To update: quit Instagram, then run `./instagram-on-mac update`. Instagram can still expire a login itself.
+</details>
+
+**Update:** quit Instagram and Mac.apk, then run `./instagram-on-mac update`.
+
+**Known issue:** the video editor can open blank and use high CPU. Posting is not yet verified.
 
 ## Instructions for Agents
+
+<details>
+<summary>Setup, checks, and safety rules</summary>
+
+This recipe builds [Mac.apk](https://github.com/kksimp/Mac.apk) locally from pinned source and patches. It distributes no app or APK binaries.
 
 1. Read `specs/project.md`, `upstream.lock.json`, `tools.lock.json`, `src/workflow.py`, and `src/apk_tools.py` before changing or installing anything.
 2. Use Apple Silicon, macOS 26.4+, Mac.apk 1.0.2303, and Instagram 445.0.0.45.83 only. The lock pins the Mac.apk source commit, release digest, patch digests, Google tools, and Instagram publisher certificates.
@@ -59,7 +62,7 @@ To update: quit Instagram, then run `./instagram-on-mac update`. Instagram can s
    ```sh
    ./instagram-on-mac fetch --locked
    ./instagram-on-mac build --locked --dry-run
-   ./instagram-on-mac build --locked [--rebuild]
+   ./instagram-on-mac build --locked
    ./instagram-on-mac install --apk PATH --locked
    ./instagram-on-mac install --apk-url URL --apk-sha256 SHA256 --locked
    ./instagram-on-mac update --check
@@ -74,4 +77,8 @@ Do not claim the video editor works after **Next**: it can show a blank preview 
 
 Use `scripts/check_privacy.py` before sharing changes. See `SECURITY.md` for security reports and `CONTRIBUTING.md` for patch and test rules. The source pins live in `upstream.lock.json`; implementation and test coverage lives in `src/`, `patches/`, and `tests/`.
 
-This recipe and its patches use [AGPL-3.0-only](LICENSE). Keep upstream copyright and third-party notices. This project is unaffiliated with Meta, Instagram, or the Mac.apk authors.
+</details>
+
+[License](LICENSE) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+
+Unaffiliated with Meta, Instagram, or the Mac.apk authors.
