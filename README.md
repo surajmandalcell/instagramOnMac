@@ -2,7 +2,11 @@
 
 ![Instagram on Mac](assets/cover.png)
 
-## For humans
+**Instagram APK, running natively on Mac.**
+
+Built for browsing and posting.
+
+## Instructions for Humans
 
 Run Instagram's Android app on an Apple Silicon Mac with [Mac.apk](https://github.com/kksimp/Mac.apk). Build it locally with this recipe. No Android virtual machine is needed.
 
@@ -20,7 +24,7 @@ Run Instagram's Android app on an Apple Silicon Mac with [Mac.apk](https://githu
 
 **Easiest with an AI coding agent:** give it the repository link and this prompt:
 
-> Set up Instagram on Mac from https://github.com/surajmandalcell/instagramOnMac. Follow the For AI agents section. Explain any missing prerequisite in simple terms. Keep my existing app data and do not publish test posts.
+> Set up Instagram on Mac from https://github.com/surajmandalcell/instagramOnMac. Follow the Instructions for Agents section. Explain any missing prerequisite in simple terms. Keep my existing app data and do not publish test posts.
 
 **Prefer the terminal?** Install Xcode Command Line Tools first. Replace `/Volumes/Data` below with your external drive:
 
@@ -36,7 +40,7 @@ Set `MACAPK_SIGN_IDENTITY` to your certificate name if you have no existing Mac.
 
 To update: quit Instagram, then run `./instagram-on-mac update`. Instagram can still expire a login itself.
 
-## For AI agents
+## Instructions for Agents
 
 1. Read `specs/project.md`, `upstream.lock.json`, `tools.lock.json`, `src/workflow.py`, and `src/apk_tools.py` before changing or installing anything.
 2. Use Apple Silicon, macOS 26.4+, Mac.apk 1.0.2303, and Instagram 445.0.0.45.83 only. The lock pins the Mac.apk source commit, release digest, patch digests, Google tools, and Instagram publisher certificates.
