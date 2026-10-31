@@ -21,7 +21,8 @@ ALLOWED_SUFFIXES = {".py", ".sh", ".md", ".json", ".txt", ".patch", ".diff", ".y
 ALLOWED_NAMES = {".gitignore", ".gitattributes", "instagram-on-mac", "LICENSE"}
 PUBLIC_COVER = "assets/cover.svg"
 PUBLIC_PNG_COVER = "assets/cover.png"
-PUBLIC_PNG_SHA256 = "cb966fe316de69c76a4afa0a17248159a7afec9779b9c461ac2d5179119a80b0"
+PUBLIC_PNG_SHA256 = "517d9ed35afc3c8c93e79d32654c8fdd64a7a1ae451a7c37c0757a54d9442f10"
+HISTORICAL_PNG_SHA256 = {"cb966fe316de69c76a4afa0a17248159a7afec9779b9c461ac2d5179119a80b0"}
 PUBLIC_REPOSITORY = "https://github.com/surajmandalcell/instagramOnMac"
 PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----"),
@@ -86,9 +87,10 @@ def valid_cover_png(data: bytes) -> bool:
     return False
 
 
-def inspect_file(path: str, data: bytes, markers: set[str]) -> list[str]:
+def inspect_file(path: str, data: bytes, markers: set[str], *, historical: bool = False) -> list[str]:
     if path == PUBLIC_PNG_COVER:
-        if hashlib.sha256(data).hexdigest() != PUBLIC_PNG_SHA256 or not valid_cover_png(data):
+        accepted = {PUBLIC_PNG_SHA256} | (HISTORICAL_PNG_SHA256 if historical else set())
+        if hashlib.sha256(data).hexdigest() not in accepted or not valid_cover_png(data):
             return ["cover must match the approved metadata-free RGB PNG"]
         return []
     relative = Path(path)
@@ -176,7 +178,7 @@ def main() -> int:
                 continue
             result = git("cat-file", "blob", object_id.decode())
             failures.extend(("history:" + os.fsdecode(name), error)
-                            for error in inspect_file(os.fsdecode(name), result.stdout, markers))
+                            for error in inspect_file(os.fsdecode(name), result.stdout, markers, historical=True))
     for name, label in failures:
         print(f"FAIL {name}: {label}")
     if failures:

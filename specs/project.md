@@ -4,7 +4,7 @@
 - Never include account data, tokens, cookies, app databases, logs, screenshots, media, APKs, build products, signing keys, personal paths, account identifiers, or local signing identities.
 - Keep Git author and committer metadata generic for this repository. Do not add a remote or publish it without a separate request.
 - Publish a source-only experimental release with a reproducible setup, clear limitations, and approved cover art. Never publish personal screenshots or account media.
-- Use C2 / Editorial Serif as the final cover: a large pink camera, thin window rule, large serif Instagram title, and smaller on Mac text. Keep the chosen pixels unchanged and remove image metadata. The only approved raster asset is assets/cover.png, pinned by the privacy check.
+- Use C2 / Editorial Serif as the final cover: a large pink camera, thin window rule without traffic lights, large serif Instagram title, and smaller on Mac text. Align both footer lines with the title's visible I left edge and the end of on Mac with its final m right edge. Preserve the approved style and remove image metadata. The only approved raster asset is assets/cover.png, pinned by the privacy check.
 - Download Mac.apk from its official GitHub release. Pin the tested source commit and download checksums. Retain upstream license notices.
 - Fetch, patch, build, install, check for updates, and update through one command-line entry point.
 - Fail before changing installed apps if a new release is unsupported, a checksum fails, a patch does not apply, a build fails, or signing fails.

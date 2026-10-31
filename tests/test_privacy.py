@@ -16,6 +16,16 @@ spec.loader.exec_module(privacy)
 
 
 class PrivacyTests(unittest.TestCase):
+    def test_old_approved_cover_is_allowed_only_in_history(self):
+        from unittest.mock import patch
+        data = (privacy.ROOT / privacy.PUBLIC_PNG_COVER).read_bytes()
+        current_hash = privacy.PUBLIC_PNG_SHA256
+        with patch.object(privacy, "PUBLIC_PNG_SHA256", "0" * 64), \
+             patch.object(privacy, "HISTORICAL_PNG_SHA256", {current_hash}):
+            self.assertTrue(privacy.inspect_file(privacy.PUBLIC_PNG_COVER, data, set()))
+            self.assertFalse(privacy.inspect_file(privacy.PUBLIC_PNG_COVER, data, set(), historical=True))
+            self.assertTrue(privacy.inspect_file("assets/private.png", data, set(), historical=True))
+
     def test_only_exact_approved_png_cover_is_allowed(self):
         data = (privacy.ROOT / privacy.PUBLIC_PNG_COVER).read_bytes()
         self.assertFalse(privacy.inspect_file(privacy.PUBLIC_PNG_COVER, data, set()))
