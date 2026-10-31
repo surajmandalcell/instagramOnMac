@@ -1,0 +1,162 @@
+--- a/runtime/java/android/provider/MediaStoreProvider.java
++++ b/runtime/java/android/provider/MediaStoreProvider.java
+@@ -459,9 +459,22 @@
+ 
+     private String callerAccessWhere(int kind, boolean downloadsOnly, int permissions) {
+         String owner = getContext() == null ? null : getContext().getPackageName();
++        if (!selectedOnlyCaller()) {
++            String clause = accessWhere(kind, downloadsOnly, permissions);
++            return clause == null || owner == null ? clause : "(" + clause + ") OR "
++                + COL_OWNER_PKG + "='" + owner.replace("'", "''") + "'";
++        }
+         if (owner == null) return "0";
+         return COL_ID + " IN (SELECT media_id FROM " + SELECTED_TABLE
+             + " WHERE ready=1 AND owner='" + owner.replace("'", "''") + "')";
++    }
++
++    private boolean selectedOnlyCaller() {
++        return getContext() != null && "com.instagram.android".equals(getContext().getPackageName());
++    }
++
++    private boolean photosEnabledForCaller() {
++        return !selectedOnlyCaller() && photosEnabled();
+     }
+ 
+     private static String selectedFileKey(File file) {
+@@ -535,7 +548,7 @@
+                 }
+             }
+             mDb.execSQL(CREATE_MAP_SQL);
+-            if (photosEnabled()) {
++            if (photosEnabledForCaller()) {
+                 mDb.execSQL(CREATE_PHOTOS_SQL);
+                 // "is anything still to export" runs on EVERY query that reads bytes.
+                 mDb.execSQL("CREATE INDEX IF NOT EXISTS idx_photos_pending ON "
+@@ -1030,8 +1043,9 @@
+         Long id = extractId(seg, route);
+         if (id == null) return route.dirType;
+         if (mDb != null) {
+-            try (Cursor c = mDb.query(TABLE, new String[]{COL_MIME_TYPE}, COL_ID + "=? AND ("
+-                    + callerAccessWhere(route.mediaTypeFilter, route.downloadsOnly, access()) + ")",
++            String accessSql = callerAccessWhere(route.mediaTypeFilter, route.downloadsOnly, access());
++            try (Cursor c = mDb.query(TABLE, new String[]{COL_MIME_TYPE}, COL_ID + "=?"
++                    + (accessSql == null ? "" : " AND (" + accessSql + ")"),
+                     new String[]{String.valueOf(id)}, null, null, null)) {
+                 if (c != null && c.moveToFirst()) {
+                     String m = c.getString(0);
+@@ -1097,8 +1111,11 @@
+             // answer here.
+             Sub sub = subFor(seg);
+             if (sub != null) {
+-                // No derived legacy collection may expose media that was not selected.
+-                return new MatrixCursor(cols);
++                if (selectedOnlyCaller()) return new MatrixCursor(cols);
++                if (mDb == null) return null;
++                if (!subVisible(seg.size() > 1 ? seg.get(1) : "", access())) return new MatrixCursor(cols);
++                if (sub.needsSync) sync(false);
++                return derivedQuery(sub, cols, selection, selectionArgs, sortOrder);
+             }
+             com.macapk.loader.NativeLog.w(TAG, "query: unrecognized media URI " + uri);
+             // AOSP: an unmatched UriMatcher throws IllegalArgumentException from
+@@ -1139,7 +1156,7 @@
+             if (selectionArgs != null) args.addAll(Arrays.asList(selectionArgs));
+         }
+ 
+-        if (photosEnabled() && wantsBytes(cols)) {
++        if (photosEnabledForCaller() && wantsBytes(cols)) {
+             materializePhotos(where.toString(), args.toArray(new String[0]), sortOrder);
+         }
+         Cursor out = safeQuery(cols, where.toString(), args.toArray(new String[0]), sortOrder);
+@@ -1175,7 +1192,8 @@
+         // ever filtered the READ path, so an app with just READ_MEDIA_IMAGES
+         // could open, and truncate, the user's own ~/Pictures photo through a
+         // "w" mode.
+-        if (mode != null && !"r".equals(mode)) {
++        if ((selectedOnlyCaller() && mode != null && !"r".equals(mode))
++                || (modeWantsWrite(pfdMode) && !writeAllowed(a))) {
+             throw new SecurityException("no write access to " + uri);
+         }
+ 
+@@ -1198,7 +1216,7 @@
+             throw new FileNotFoundException("no row for " + uri);
+         }
+         File f = new File(path);
+-        if (photosEnabled()) {
++        if (photosEnabledForCaller()) {
+             String[] photo = photoByData(path);
+             if (photo != null) {
+                 // Design decision 2: the Photos library is READ-ONLY to Android
+@@ -1217,7 +1235,12 @@
+             }
+         }
+         if (!f.exists()) throw new FileNotFoundException(path);
+-        return com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(path);
++        if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(path)) {
++            if (modeWantsWrite(pfdMode)) throw new SecurityException("no write access to selected reference");
++            return com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(path);
++        }
++        if (selectedOnlyCaller()) throw new FileNotFoundException("Selected reference is unavailable");
++        return ParcelFileDescriptor.open(f, pfdMode);
+     }
+ 
+     /** AOSP MediaProvider.openTypedAssetFileCommon (packages/providers/MediaProvider
+@@ -1280,7 +1303,7 @@
+                 }
+             }
+         }
+-        if (wantsThumb && mDb != null && photosEnabled() && uri != null) {
++        if (wantsThumb && mDb != null && photosEnabledForCaller() && uri != null) {
+             List<String> seg = uri.getPathSegments();
+             Route route = routeFor(seg);
+             Long id = route != null ? extractId(seg, route) : null;
+@@ -1394,7 +1417,30 @@
+     // Queries read the committed index. Scanning never holds the provider
+     // monitor or a write transaction while it reads host metadata.
+     private synchronized void sync(boolean mayPrompt) {
+-        // Selection is the only index input. Never scan host folders or Photos.
++        // Instagram uses explicit selection. Other apps retain the normal library.
++        if (selectedOnlyCaller()) return;
++        mScanMayPrompt |= mayPrompt;
++        if (mScanClosed || mDb == null || mScanRunning) return;
++        long now = System.nanoTime();
++        if (mLastScanNanos != 0 && now - mLastScanNanos < TimeUnit.SECONDS.toNanos(5)) return;
++        mLastScanNanos = now;
++        mScanRunning = true;
++        Thread scanner = new Thread(() -> {
++            boolean changed = false;
++            try { changed = scanVolume(mayPrompt); }
++            catch (Throwable failure) { com.macapk.loader.NativeLog.w(TAG, "scan failed: " + failure); }
++            finally {
++                synchronized (this) { mScanRunning = false; }
++            }
++            if (changed && !mScanClosed && getContext() != null) {
++                android.content.ContentResolver resolver = getContext().getContentResolver();
++                resolver.notifyChange(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null);
++                resolver.notifyChange(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, null);
++                resolver.notifyChange(MediaStore.Files.getContentUri("external"), null);
++            }
++        }, "macapk-media-scan");
++        scanner.setDaemon(true);
++        scanner.start();
+     }
+ 
+     private long databaseChanges() {
+@@ -1424,7 +1470,7 @@
+         }
+ 
+         Set<String> seen = new HashSet<>();
+-        final boolean photosOn = photosEnabled();
++        final boolean photosOn = photosEnabledForCaller();
+         // An exported Photos copy is a real file in DCIM/Camera, so the walk finds
+         // it; its row belongs to the Photos pass (dates and size from PhotoKit, not
+         // from the copy's own mtime), so the file pass leaves it alone.
+@@ -2685,7 +2731,8 @@
+ 
+     /** MACAPK_PHOTOKIT, default ON. */
+     static boolean photosEnabled() {
+-        return false;
++        String e = System.getenv("MACAPK_PHOTOKIT");
++        return e == null || e.isEmpty() || e.charAt(0) != '0';
+     }
+ 
+     /** The diagnostic directory backend, or null for PhotoKit. */

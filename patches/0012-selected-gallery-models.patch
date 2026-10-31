@@ -1,0 +1,135 @@
+--- a/runtime/java/android/provider/MediaStoreProvider.java
++++ b/runtime/java/android/provider/MediaStoreProvider.java
+@@ -493,6 +493,22 @@
+         if (displayName == null) return MimeTypeMap.getFileExtensionFromUrl(data);
+         int dot = displayName.lastIndexOf('.');
+         return dot < 0 ? "" : displayName.substring(dot + 1);
++    }
++
++    /** Runtime-owned selected references only; never inspect an application's cache or database. */
++    public static Map<Integer, String> macapkSelectedReferenceSnapshot() {
++        Map<Integer, String> selected = new HashMap<>();
++        android.content.ContentProvider registered = android.content.ContentProviderRegistry.get(MediaStore.AUTHORITY);
++        if (!(registered instanceof MediaStoreProvider provider) || provider.mDb == null || !provider.selectedOnlyCaller()) return selected;
++        try (Cursor rows = provider.mDb.query(TABLE, new String[]{COL_ID, COL_DATA},
++                provider.callerAccessWhere(-1, false, 0), null, null, null, null)) {
++            while (rows != null && rows.moveToNext()) {
++                String alias = rows.getString(1);
++                if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(alias))
++                    selected.put(rows.getInt(0), alias);
++            }
++        }
++        return selected;
+     }
+ 
+     private boolean photosEnabledForCaller() {
+--- a/runtime/java/com/macapk/loader/ClassFileRewriter.java
++++ b/runtime/java/com/macapk/loader/ClassFileRewriter.java
+@@ -175,8 +175,9 @@
+         boolean optionalOptics = matchesOptionalOptics(raw, className);
+         boolean accountSections = matchesAccountSections(raw, className);
+         boolean selectedMedium = matchesSelectedMedium(raw, className);
++        boolean selectedGallery = matchesSelectedGallery(raw, className);
+         if (PRESCAN_ENABLED) {
+-            boolean needsParse = optionalOptics || accountSections || selectedMedium || needsFullParse(raw, className);
++            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || needsFullParse(raw, className);
+             if (PRESCAN_STATS) {
+                 long seen = prescanSeen.incrementAndGet();
+                 if (needsParse) prescanFullParsed.incrementAndGet();
+@@ -461,6 +462,12 @@
+                     if (m.code != null && "A03".equals(cf.utf8(m.nameIndex))
+                             && "()Ljava/lang/String;".equals(cf.utf8(m.descIndex)))
+                         hits += redirectSelectedDataExtension(cf, m.code);
++                }
++            }
++            if (selectedGallery) {
++                for (MethodEntry m : cf.methods) {
++                    if (m.code != null && "A0A".equals(cf.utf8(m.nameIndex))
++                            && "()V".equals(cf.utf8(m.descIndex))) hits += redirectSelectedGallery(cf, m.code);
+                 }
+             }
+             if (hits > 0) {
+@@ -1094,10 +1101,33 @@
+                 && !"com/instagram/common/gallery/Medium".equals(name)) return false;
+         try {
+             return "793d9e5e69e117d909ef3e13c1e8c4bf5bc684b33ee57405f0fd7dc094f8def3".equals(
++                java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
++        } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
++    }
++
++    private static boolean matchesSelectedGallery(byte[] raw, String name) {
++        if (!"X.D5A".equals(name) && !"X/D5A".equals(name)) return false;
++        try {
++            return "aff7eb0b79c3aea1ef9e24acc882ce0325f037c65f52aa75ec1a9cae55a9534a".equals(
+                 java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
+         } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
+     }
+ 
++    private static int redirectSelectedGallery(ClassFile cf, CodeAttr code) {
++        int pc = code.codeOffset;
++        // Two unused null initializers; both locals are assigned before the first branch.
++        // Replacing exactly four bytes leaves all branch/stack-map offsets unchanged.
++        if (code.codeLen < 4 || code.code[pc] != 1 || code.code[pc + 1] != 0x4c
++                || code.code[pc + 2] != 1 || code.code[pc + 3] != 0x4d) return 0;
++        int owner = cf.findOrAddClass("com/macapk/loader/InstagramGallerySelectionCompat");
++        int type = cf.findOrAddNameAndType("sanitizeModel", "(Ljava/lang/Object;)V");
++        int method = cf.findOrAddMethodref(owner, type);
++        code.code[pc] = 0x2a;
++        code.code[pc + 1] = (byte) OP_INVOKESTATIC;
++        writeU2(code.code, pc + 2, method);
++        return 1;
++    }
++
+     private static int redirectSelectedDataExtension(ClassFile cf, CodeAttr code) {
+         int hits = 0;
+         for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
+--- /dev/null
++++ b/runtime/java/com/macapk/loader/InstagramGallerySelectionCompat.java
+@@ -0,0 +1,47 @@
++package com.macapk.loader;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++/** Filters the tested gallery model before it computes adapter rows and positions. */
++public final class InstagramGallerySelectionCompat {
++    private InstagramGallerySelectionCompat() {}
++
++    public static void sanitizeModel(Object model) {
++        if (model == null || !"X.D5A".equals(model.getClass().getName())) return;
++        Map<Integer, String> selected = android.provider.MediaStoreProvider.macapkSelectedReferenceSnapshot();
++        for (String name : new String[]{"A0T", "A0U", "A0V", "A0W", "A0X", "A0Y"}) {
++            try {
++                Field field = model.getClass().getField(name);
++                field.setAccessible(true);
++                Object value = field.get(model);
++                if (!(value instanceof List<?> source)) continue;
++                List<Object> filtered = new ArrayList<>();
++                for (Object item : source) if (allowed(item, selected)) filtered.add(item);
++                // Never remove from a shared source/cache list. The UI model owns this copy.
++                field.set(model, filtered);
++            } catch (ReflectiveOperationException failure) {
++                throw new IllegalStateException("The tested gallery model shape changed", failure);
++            }
++        }
++    }
++
++    private static boolean allowed(Object item, Map<Integer, String> selected) {
++        if (item == null) return false;
++        if ("com.instagram.common.gallery.model.GalleryItem$CameraCaptureMedium".equals(item.getClass().getName())) return true;
++        try {
++            Object medium = item;
++            if (!"com.instagram.common.gallery.Medium".equals(item.getClass().getName())) {
++                medium = item.getClass().getField("A02").get(item);
++                if (medium == null && "com.instagram.common.gallery.model.GalleryItem$LocalGalleryMedium".equals(item.getClass().getName()))
++                    medium = item.getClass().getField("A00").get(item);
++            }
++            if (medium == null || !"com.instagram.common.gallery.Medium".equals(medium.getClass().getName())) return false;
++            int id = medium.getClass().getField("A06").getInt(medium);
++            Object data = medium.getClass().getField("A0e").get(medium);
++            return data instanceof String && data.equals(selected.get(id));
++        } catch (ReflectiveOperationException unsupportedItem) { return false; }
++    }
++}

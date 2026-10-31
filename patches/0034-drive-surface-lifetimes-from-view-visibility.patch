@@ -1,0 +1,125 @@
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -412,7 +412,71 @@
+      *  holder's surfaceCreated (0 = none yet). v1.0.1637. */
+     private int macapkConvergedW, macapkConvergedH;
+ 
+-    protected final void macapkConvergeSurfaceLifecycle(int widthPx, int heightPx) {
++    private boolean macapkViewLifecyclePosted;
++    private boolean macapkViewDestroyPending;
++    private boolean macapkViewSurfaceEligible() {
++        return isAttachedToWindow() && isShown() && getWidth() > 0 && getHeight() > 0;
++    }
++
++    /** View traversal drives every surface, independently of the shared renderer. */
++    public final void macapkConvergeViewSurfaceLifecycle() {
++        if (holder == null || macapkPostLock == null) return;
++        boolean visible = macapkViewSurfaceEligible();
++        synchronized (macapkPostLock) {
++            if (!visible) macapkViewDestroyPending = true;
++            if (macapkViewLifecyclePosted) return;
++            if (visible && !macapkViewDestroyPending && holderSurfaceCreatedFired
++                    && getWidth() == macapkConvergedW && getHeight() == macapkConvergedH) return;
++            if (!visible && !holderSurfaceCreatedFired && !macapkCreatePosted) return;
++            macapkViewLifecyclePosted = true;
++        }
++        macapkPostToUiThread(() -> {
++            boolean destroy;
++            synchronized (macapkPostLock) {
++                macapkViewLifecyclePosted = false;
++                destroy = macapkViewDestroyPending;
++                macapkViewDestroyPending = false;
++            }
++            if (destroy || !macapkViewSurfaceEligible()) {
++                if (holderSurfaceCreatedFired) {
++                    holderSurfaceCreatedFired = false;
++                    macapkConvergedW = macapkConvergedH = 0;
++                    pendingSurfaceW = pendingSurfaceH = 0;
++                    holder.fireDestroyed();
++                }
++                if (macapkViewSurfaceEligible()) macapkConvergeViewSurfaceLifecycle();
++                return;
++            }
++            int width = getWidth(), height = getHeight();
++            if (!holderSurfaceCreatedFired) {
++                if (macapkHolderDispatchReady()) macapkTryFireHolderCreatedHere(width, height);
++            } else if (width != macapkConvergedW || height != macapkConvergedH) {
++                macapkConvergedW = width; macapkConvergedH = height;
++                int[] size = macapkHolderSurfaceSize(width, height);
++                holder.fireChanged(0, size[0], size[1]);
++            }
++        });
++    }
++
++    @Override protected void onVisibilityChanged(View changed, int visibility) {
++        super.onVisibilityChanged(changed, visibility);
++        macapkConvergeViewSurfaceLifecycle();
++    }
++    @Override public void onAttachedToWindow() {
++        super.onAttachedToWindow();
++        macapkConvergeViewSurfaceLifecycle();
++    }
++    @Override public void onDetachedFromWindow() {
++        super.onDetachedFromWindow();
++        macapkConvergeViewSurfaceLifecycle();
++    }
++    @Override public void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
++        super.onSizeChanged(width, height, oldWidth, oldHeight);
++        macapkConvergeViewSurfaceLifecycle();
++    }
++
++    public final void macapkConvergeSurfaceLifecycle(int widthPx, int heightPx) {
++        if (!macapkViewSurfaceEligible()) { macapkConvergeViewSurfaceLifecycle(); return; }
+         // The renderer path (GLSurfaceView) never reaches macapkSurfaceChanged
+         // below once it owns a Renderer, so until its native entry records the
+         // display itself (macapkNoteNativeDisplaySize) this per-frame size is
+@@ -587,6 +651,8 @@
+     }
+ 
+     private boolean macapkTryFireHolderCreatedHere(int widthPx, int heightPx) {
++        if (!macapkViewSurfaceEligible()) return false;
++        synchronized (macapkPostLock) { if (macapkViewDestroyPending) return false; }
+         if (!holder.fireCreatedTolerant()) return false;
+         holderSurfaceCreatedFired = true;
+         pendingSurfaceW = 0;
+@@ -3839,6 +3905,7 @@
+      *  latch as macapkSurfaceChanged so doubled invocations won't
+      *  produce two surfaceCreated callbacks. */
+     public final void macapkNotifySurfaceReady(int widthPx, int heightPx) {
++        if (!macapkViewSurfaceEligible()) { macapkConvergeViewSurfaceLifecycle(); return; }
+         if (!holderSurfaceCreatedFired) {
+             holder.fireCreated();
+             holderSurfaceCreatedFired = true;
+@@ -3894,7 +3961,7 @@
+                 macapkPostToUiThread(() -> {
+                     synchronized (callbacks) {
+                         if (callbackRegistrations.get(cb) != registration || surfaceGeneration != generation
+-                                || !owner.holderSurfaceCreatedFired) return;
++                                || !owner.holderSurfaceCreatedFired || !owner.macapkViewSurfaceEligible()) return;
+                     }
+                     try {
+                         cb.surfaceCreated(this);
+--- a/runtime/java/com/macapk/loader/ViewCanvasDriver.java
++++ b/runtime/java/com/macapk/loader/ViewCanvasDriver.java
+@@ -1737,6 +1737,7 @@
+             // frame to avoid a blank and let convergence happen on the next.
+             try { vto.dispatchOnPreDraw(); } catch (Throwable t) { com.macapk.loader.GfxTrace.swallow("dispatchOnPreDraw", t); }
+         }
++        if (hasGl) macapkConvergeSurfaceTree(rootView, new java.util.IdentityHashMap<>());
+         try {
+             // v1.0.134: translate the canvas DOWN by the status-bar
+             // height so the rootView (whose top is statusBarH in
+@@ -4426,6 +4427,13 @@
+         return fallback;
+     }
+ 
++    private static void macapkConvergeSurfaceTree(android.view.View view, java.util.IdentityHashMap<android.view.View, Boolean> seen) {
++        if (view == null || seen.put(view, Boolean.TRUE) != null) return;
++        if (view instanceof android.view.SurfaceView surface) surface.macapkConvergeViewSurfaceLifecycle();
++        if (view instanceof android.view.ViewGroup group)
++            for (int i = 0; i < group.getChildCount(); i++) macapkConvergeSurfaceTree(group.getChildAt(i), seen);
++    }
++
+     private static boolean treeHasSurfaceView(android.view.View v) {
+         return treeHasSurfaceViewRec(v, new java.util.IdentityHashMap<>());
+     }

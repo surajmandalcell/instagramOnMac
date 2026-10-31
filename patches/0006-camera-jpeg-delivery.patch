@@ -1,0 +1,363 @@
+--- a/runtime/java/android/hardware/camera2/CameraBackend.java
++++ b/runtime/java/android/hardware/camera2/CameraBackend.java
+@@ -225,7 +225,7 @@
+         // implemented on top of the older camera API, with limited
+         // capabilities" -- which is a precise description of an AVFoundation
+         // capture session dressed as camera2. We support a repeating preview
+-        // request into a YUV_420_888 output and nothing else: no per-frame
++        // request into YUV_420_888 and encoded JPEG output: no per-frame
+         // control, no meaningful per-request result metadata, no reprocessing.
+         // Claiming LIMITED or FULL would promise per-request behaviour we
+         // cannot honour, and an app that trusted it would fail deeper.
+@@ -295,17 +295,15 @@
+ 
+         p.put(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP,
+                 StreamConfigurationMap.macapkCreate(
+-                        new int[] { android.graphics.ImageFormat.YUV_420_888 },
++                        new int[] { android.graphics.ImageFormat.YUV_420_888, android.graphics.ImageFormat.JPEG },
+                         fmt.sizes,
+                         fmt.fpsRanges));
+ 
+-        // The request keys we actually act on. CONTROL_AE_TARGET_FPS_RANGE is
+-        // the only one: CameraCaptureSessionImpl passes its upper bound to
+-        // CameraBridge.configure(). Naming a key we ignore would be worse than
+-        // naming none -- the app would set it, see it in the list, and believe
+-        // it took effect.
++        // Request keys honored by stream configuration and targeted JPEG encoding.
+         List<CaptureRequest.Key<?>> requestKeys = new ArrayList<>();
+         requestKeys.add(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE);
++        requestKeys.add(CaptureRequest.JPEG_QUALITY);
++        requestKeys.add(CaptureRequest.JPEG_ORIENTATION);
+ 
+         // The result keys the capture session actually fills in. Exactly one:
+         // every CaptureResult carries SENSOR_TIMESTAMP and nothing else, so
+--- a/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
++++ b/runtime/java/android/hardware/camera2/CameraCaptureSessionImpl.java
+@@ -254,14 +254,12 @@
+                     + " SurfaceTexture outputs and will receive no frames.");
+         }
+ 
+-        // 2. Format. YUV_420_888 is the only thing the capture backend produces,
+-        //    and an ImageReader created for another format would hand its app
+-        //    planes that do not match what it asked for.
++        // 2. The native stream provides YUV; targeted JPEG readers encode an owned snapshot.
+         for (ImageReader r : readers) {
+-            if (r.getImageFormat() != ImageFormat.YUV_420_888) {
++            if (r.getImageFormat() != ImageFormat.YUV_420_888 && r.getImageFormat() != ImageFormat.JPEG) {
+                 CameraBackend.warn("createCaptureSession FAILED: ImageReader format 0x"
+                         + Integer.toHexString(r.getImageFormat())
+-                        + " is not supported. This backend produces YUV_420_888 (0x23) only;"
++                        + " is not supported. This backend produces YUV_420_888 or encoded JPEG;"
+                         + " CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP advertises"
+                         + " no other output format.");
+                 return false;
+@@ -280,10 +278,20 @@
+         int h = 0;
+         if (!readers.isEmpty()) {
+             ImageReader first = readers.get(0);
++            for (ImageReader reader : readers) {
++                if (reader.getImageFormat() == ImageFormat.JPEG
++                        && (first.getImageFormat() != ImageFormat.JPEG
++                            || (long)reader.getWidth() * reader.getHeight() > (long)first.getWidth() * first.getHeight())) first = reader;
++            }
+             w = first.getWidth();
+             h = first.getHeight();
+             for (ImageReader r : readers) {
+                 if (r.getWidth() != w || r.getHeight() != h) {
++                    if (first.getImageFormat() == ImageFormat.JPEG) {
++                        CameraBackend.warn("createCaptureSession FAILED: mixed ImageReader sizes with JPEG"
++                                + " are not supported by this single-stream backend");
++                        return false;
++                    }
+                     CameraBackend.warn("this session has ImageReader outputs of different sizes ("
+                             + w + "x" + h + " and " + r.getWidth() + "x" + r.getHeight()
+                             + "). The capture backend drives ONE stream, so every output receives "
+@@ -955,26 +963,7 @@
+         // camera2 reports TIMESTAMP_SOURCE_UNKNOWN for this device, whose whole
+         // meaning is "monotonic, but not comparable with other subsystems".
+         final long timestampNs = System.nanoTime();
+-
+-        for (ImageReader r : mReaders) {
+-            r.macapkOnCameraFrame();
+-        }
+ 
+-        // SurfaceTexture outputs: publish the frame's metadata; the consumer's
+-        // own latch (updateTexImage / TextureView draw) pulls the pixels. The
+-        // PTS is the newest delivered frame's, straight from the native layer;
+-        // if that read races a stop() and comes back 0, the observation
+-        // instant above is the honest same-domain fallback. The latch replaces
+-        // it with the copied frame's exact PTS anyway.
+-        List<SurfaceTexture> textures = mSurfaceTextures;
+-        if (!textures.isEmpty()) {
+-            long pts = CameraBridge.latestFrameTimestamp(mHandle);
+-            if (pts == 0) pts = timestampNs;
+-            for (SurfaceTexture st : textures) {
+-                st.macapkQueueFrame(pts, MTX_FLIP_V, 0);
+-            }
+-        }
+-
+         CaptureRequest request;
+         CaptureCallback callback;
+         CameraDispatch dispatch;
+@@ -1008,6 +997,17 @@
+             }
+         }
+ 
++        List<Surface> lost = dispatchImageReaders(request, mReaders);
++        if (request != null) {
++            List<Surface> targets = request.getTargets();
++            long pts = CameraBridge.latestFrameTimestamp(mHandle);
++            if (pts == 0) pts = timestampNs;
++            for (SurfaceTexture texture : mSurfaceTextures) {
++                boolean targeted = false;
++                for (Surface surface : targets) if (surface.macapkGetSurfaceTexture() == texture) { targeted = true; break; }
++                if (targeted) texture.macapkQueueFrame(pts, MTX_FLIP_V, 0);
++            }
++        }
+         if (callback == null || dispatch == null || request == null) {
+             // No callback registered for this frame. The readers were still
+             // notified above, which is what a request with an ImageReader
+@@ -1022,6 +1022,7 @@
+         final boolean last = endsSequence;
+ 
+         dispatch.run(() -> cb.onCaptureStarted(this, req, timestampNs, deliveredCount));
++        for (Surface target : lost) dispatch.run(() -> cb.onCaptureBufferLost(this, req, target, deliveredCount));
+ 
+         // The result carries only what we measured. SENSOR_TIMESTAMP is the
+         // observation instant described above; exposure time, sensitivity and
+@@ -1041,4 +1042,22 @@
+             stopPumpIfIdle();
+         }
+     }
++
++    /** A configured output receives bytes only when this request targets its Surface. */
++    static List<Surface> dispatchImageReaders(CaptureRequest request, List<ImageReader> readers) {
++        List<Surface> lost = new ArrayList<>();
++        if (request == null) return lost;
++        List<Surface> targets = request.getTargets();
++        Byte quality = request.get(CaptureRequest.JPEG_QUALITY);
++        Integer orientation = request.get(CaptureRequest.JPEG_ORIENTATION);
++        for (ImageReader reader : readers) {
++            Surface surface = reader.getSurface();
++            if (!targets.contains(surface)) continue;
++            if (reader.getImageFormat() == ImageFormat.JPEG) {
++                if (!reader.macapkOnCameraFrame(quality == null ? 90 : quality & 0xff,
++                        orientation == null ? 0 : orientation)) lost.add(surface);
++            } else reader.macapkOnCameraFrame();
++        }
++        return lost;
++    }
+ }
+--- a/runtime/java/android/media/ImageReader.java
++++ b/runtime/java/android/media/ImageReader.java
+@@ -77,6 +77,11 @@
+     private CameraImage mOutstanding;
+     private boolean mWarnedOutstanding;
+     private long mDroppedWhileBusy;
++    private boolean mClosed;
++    private boolean mJpegEncoding;
++    private int mJpegGeneration;
++    private final java.util.ArrayDeque<JpegImage> mJpegQueue = new java.util.ArrayDeque<>();
++    private final java.util.HashSet<JpegImage> mJpegAcquired = new java.util.HashSet<>();
+ 
+     protected ImageReader(int width, int height, int format, int maxImages) {
+         // AOSP's constructor rejects these outright. Letting a 0x0 reader
+@@ -176,6 +181,9 @@
+      */
+     public void macapkAttachCameraSource(long sessionHandle, int width, int height) {
+         synchronized (mCameraLock) {
++            if (mClosed) throw new IllegalStateException("ImageReader is closed");
++            if (mCameraHandle != CameraBridge.NO_SESSION && (mCameraHandle != sessionHandle
++                    || mCameraWidth != width || mCameraHeight != height)) macapkDetachCameraSource();
+             mCameraHandle = sessionHandle;
+             mCameraWidth = width;
+             mCameraHeight = height;
+@@ -189,8 +197,11 @@
+         CameraImage outstanding;
+         synchronized (mCameraLock) {
+             outstanding = mOutstanding;
+-            mOutstanding = null;
+             mCameraHandle = CameraBridge.NO_SESSION;
++            ++mJpegGeneration;
++            for (JpegImage image : new java.util.ArrayList<>(mJpegQueue)) image.close();
++            for (JpegImage image : new java.util.ArrayList<>(mJpegAcquired)) image.close();
++            mJpegQueue.clear();
+         }
+         if (outstanding != null) outstanding.close();
+     }
+@@ -206,9 +217,15 @@
+      * than from a preview that mysteriously freezes after one frame.
+      */
+     public void macapkOnCameraFrame() {
++        if (mFormat == android.graphics.ImageFormat.JPEG) return;
++        notifyImageAvailable();
++    }
++
++    private void notifyImageAvailable() {
+         OnImageAvailableListener listener;
+         android.os.Handler handler;
+         synchronized (mCameraLock) {
++            if (mClosed) return;
+             if (mOutstanding != null) {
+                 mDroppedWhileBusy++;
+                 if (mDroppedWhileBusy == 60) {
+@@ -226,6 +243,7 @@
+ 
+         final OnImageAvailableListener l = listener;
+         Runnable deliver = () -> {
++            synchronized (mCameraLock) { if (mClosed) return; }
+             try {
+                 l.onImageAvailable(this);
+             } catch (Throwable t) {
+@@ -251,6 +269,7 @@
+      *         attached, or when an Image is still outstanding.
+      */
+     public Image acquireLatestImage() {
++        if (mFormat == android.graphics.ImageFormat.JPEG) return acquireJpeg(true);
+         long handle;
+         int negotiatedWidth;
+         int negotiatedHeight;
+@@ -326,9 +345,107 @@
+      * it skip, and this comment is where that behaviour is explained.
+      */
+     public Image acquireNextImage() {
++        if (mFormat == android.graphics.ImageFormat.JPEG) return acquireJpeg(false);
+         return acquireLatestImage();
++    }
++
++    /** Encode only an explicitly targeted JPEG request. The native frame is copied, never retained. */
++    public boolean macapkOnCameraFrame(int quality, int orientation) {
++        if (mFormat != android.graphics.ImageFormat.JPEG || quality < 1 || quality > 100) return false;
++        orientation = (orientation % 360 + 360) % 360;
++        if (orientation % 90 != 0) return false;
++        int generation;
++        int[] pixels;
++        int[] dimensions = new int[2];
++        long timestamp;
++        synchronized (mCameraLock) {
++            if (mClosed || mJpegEncoding || mCameraHandle == CameraBridge.NO_SESSION
++                    || mJpegQueue.size() + mJpegAcquired.size() >= mMaxImages) return false;
++            if (mCameraWidth <= 0 || mCameraHeight <= 0 || (long)mCameraWidth * mCameraHeight > Integer.MAX_VALUE) return false;
++            pixels = new int[mCameraWidth * mCameraHeight];
++            timestamp = CameraBridge.copyLatestArgb(mCameraHandle, pixels, dimensions);
++            if (timestamp == 0 || dimensions[0] <= 0 || dimensions[1] <= 0
++                    || (long)dimensions[0] * dimensions[1] > pixels.length) return false;
++            generation = mJpegGeneration;
++            mJpegEncoding = true;
++        }
++        android.graphics.Bitmap bitmap = null;
++        boolean queued = false;
++        try {
++            bitmap = android.graphics.Bitmap.createBitmap(dimensions[0], dimensions[1], android.graphics.Bitmap.Config.ARGB_8888);
++            bitmap.setPixels(pixels, 0, dimensions[0], 0, 0, dimensions[0], dimensions[1]);
++            if (bitmap.getWidth() != mWidth || bitmap.getHeight() != mHeight) {
++                android.graphics.Bitmap scaled = android.graphics.Bitmap.createScaledBitmap(bitmap, mWidth, mHeight, true);
++                if (scaled != bitmap) bitmap.recycle();
++                bitmap = scaled;
++            }
++            if (orientation != 0) {
++                android.graphics.Matrix rotation = new android.graphics.Matrix();
++                rotation.setRotate(orientation);
++                android.graphics.Bitmap rotated = android.graphics.Bitmap.createBitmap(bitmap, 0, 0,
++                    bitmap.getWidth(), bitmap.getHeight(), rotation, true);
++                if (rotated != bitmap) bitmap.recycle();
++                bitmap = rotated;
++            }
++            java.io.ByteArrayOutputStream encoded = new java.io.ByteArrayOutputStream();
++            if (!bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, encoded)) return false;
++            byte[] bytes = encoded.toByteArray();
++            ByteBuffer buffer = ByteBuffer.allocateDirect(bytes.length);
++            buffer.put(bytes).flip();
++            synchronized (mCameraLock) {
++                if (mClosed || generation != mJpegGeneration || mJpegQueue.size() + mJpegAcquired.size() >= mMaxImages) return false;
++                mJpegQueue.addLast(new JpegImage(bitmap.getWidth(), bitmap.getHeight(), timestamp, buffer));
++                queued = true;
++            }
++        } catch (RuntimeException failure) {
++            System.err.println("[camera2] JPEG encoding failed: " + failure.getClass().getSimpleName());
++            return false;
++        } finally {
++            if (bitmap != null) bitmap.recycle();
++            synchronized (mCameraLock) { mJpegEncoding = false; }
++        }
++        if (queued) notifyImageAvailable();
++        return queued;
+     }
+ 
++    private Image acquireJpeg(boolean latest) {
++        synchronized (mCameraLock) {
++            if (mClosed) throw new IllegalStateException("ImageReader is closed");
++            if (mJpegAcquired.size() >= mMaxImages) throw new IllegalStateException("maxImages has already been acquired");
++            if (latest && mMaxImages - mJpegAcquired.size() >= 2)
++                while (mJpegQueue.size() > 1) mJpegQueue.removeFirst().close();
++            JpegImage image = mJpegQueue.pollFirst();
++            if (image != null) mJpegAcquired.add(image);
++            return image;
++        }
++    }
++
++    private final class JpegImage extends Image {
++        private final int width, height;
++        private final long timestamp;
++        private volatile ByteBuffer bytes;
++        private final Plane[] planes;
++        JpegImage(int width, int height, long timestamp, ByteBuffer bytes) {
++            this.width = width; this.height = height; this.timestamp = timestamp; this.bytes = bytes;
++            planes = new Plane[]{new Plane() {
++                @Override public ByteBuffer getBuffer() {
++                    synchronized (mCameraLock) { checkOpen(); return JpegImage.this.bytes.asReadOnlyBuffer(); }
++                }
++                @Override public int getRowStride() { checkOpen(); return 0; }
++                @Override public int getPixelStride() { checkOpen(); return 0; }
++            }};
++        }
++        private void checkOpen() { if (bytes == null) throw new IllegalStateException("Image is already closed"); }
++        @Override public int getFormat() { checkOpen(); return android.graphics.ImageFormat.JPEG; }
++        @Override public int getWidth() { checkOpen(); return width; }
++        @Override public int getHeight() { checkOpen(); return height; }
++        @Override public long getTimestamp() { checkOpen(); return timestamp; }
++        @Override public Plane[] getPlanes() { checkOpen(); return planes.clone(); }
++        @Override public void close() {
++            synchronized (mCameraLock) { bytes = null; mJpegAcquired.remove(this); mJpegQueue.remove(this); }
++        }
++    }
++
+     /** Called by CameraImage.close(). */
+     void macapkImageClosed(CameraImage image) {
+         long handle;
+@@ -365,10 +482,13 @@
+     /** AOSP frees buffers not currently in use. The capture backend owns its own
+      *  single buffer slot and there is nothing of ours to free, so this is a
+      *  no-op with no observable difference. */
+-    public void discardFreeBuffers() {}
++    public void discardFreeBuffers() {
++        synchronized (mCameraLock) { for (JpegImage image : new java.util.ArrayList<>(mJpegQueue)) image.close(); }
++    }
+ 
+     @Override
+     public void close() {
++        synchronized (mCameraLock) { mClosed = true; }
+         macapkDetachCameraSource();
+         synchronized (mCameraLock) {
+             mListener = null;
+--- a/runtime/java/android/hardware/camera2/params/StreamConfigurationMap.java
++++ b/runtime/java/android/hardware/camera2/params/StreamConfigurationMap.java
+@@ -18,13 +18,14 @@
+ // class at all because getCameraCharacteristics throws first.
+ //
+ // ---------------------------------------------------------------------------
+-// ONLY YUV_420_888 IS ADVERTISED, AND THAT IS THE HONEST ANSWER
++// NATIVE YUV AND TARGETED JPEG SNAPSHOTS
+ // ---------------------------------------------------------------------------
+ // The capture backend hands out one pixel format: NV12, described to Java as
+ // the three YUV_420_888 plane descriptors the spec permits for a semiplanar
+-// buffer (see camera_capture.mm's PIXEL FORMAT block). We cannot produce JPEG
+-// (no encoder in the capture path) and cannot produce PRIVATE (there is no
+-// opaque gralloc buffer to hand out), so neither is listed.
++// buffer (see camera_capture.mm's PIXEL FORMAT block). JPEG output is encoded
++// from a targeted captured snapshot by ImageReader; its sizes are the same
++// supported native stream geometries. Other compressed/raw formats remain unsupported.
++// PRIVATE is not listed: there is no opaque gralloc buffer to hand out.
+ //
+ // For a format that is NOT listed, getOutputSizes returns null -- not an empty
+ // array. That is AOSP's documented contract, verified verbatim from

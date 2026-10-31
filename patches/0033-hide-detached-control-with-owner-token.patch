@@ -1,0 +1,102 @@
+--- a/runtime/java/android/view/SurfaceControl.java
++++ b/runtime/java/android/view/SurfaceControl.java
+@@ -22,15 +22,15 @@
+     private String mName;
+     private int mWidth;
+     private int mHeight;
+-    private boolean mValid = true;
++    private volatile boolean mValid = true;
+     private Surface mProducerSurface;
+     private volatile SurfaceControl mParent;
+     private SurfaceView mOwner;
+     private volatile boolean mNativeWindowConsumed;
+ 
+-    void macapkNoteNativeWindowConsumer() {
++    synchronized void macapkNoteNativeWindowConsumer() {
+         mNativeWindowConsumed = true;
+-        SurfaceView.macapkNoteNativeWindowOwner(macapkOwnerSurfaceView());
++        SurfaceView.macapkNoteControlledNativeWindowOwner(mValid ? macapkOwnerSurfaceView() : null, this);
+     }
+ 
+     synchronized void macapkBindProducer(Surface surface) { mProducerSurface = surface; }
+@@ -55,7 +55,10 @@
+         mHeight = height;
+     }
+ 
+-    public void release() { mValid = false; }
++    public synchronized void release() {
++        mValid = false;
++        if (mNativeWindowConsumed) SurfaceView.macapkNoteControlledNativeWindowOwner(null, this);
++    }
+     public boolean isValid() { return mValid; }
+     public String getName() { return mName; }
+     public int getWidth() { return mWidth; }
+@@ -265,9 +268,11 @@
+             mChanges.add(() -> {
+                 for (SurfaceControl parent = newParent; parent != null; parent = parent.mParent)
+                     if (parent == sc) throw new IllegalArgumentException("cyclic SurfaceControl parent");
+-                sc.mParent = newParent;
+-                if (sc.mNativeWindowConsumed)
+-                    SurfaceView.macapkNoteNativeWindowOwner(sc.macapkOwnerSurfaceView());
++                synchronized (sc) {
++                    sc.mParent = newParent;
++                    if (sc.mNativeWindowConsumed)
++                        SurfaceView.macapkNoteControlledNativeWindowOwner(sc.mValid ? sc.macapkOwnerSurfaceView() : null, sc);
++                }
+             });
+             return this;
+         }
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -1706,6 +1706,8 @@
+     // Surface.macapkNoteNativeWindowConsumer): the layer goes below only when
+     // that view is known, and that view punches its hole.
+     private static volatile java.lang.ref.WeakReference<SurfaceView> sNativeWindowOwner;
++    private static java.lang.ref.WeakReference<Object> sNativeWindowControl;
++    private static volatile boolean sNativeWindowControlHidden;
+     /** Sticky: some SurfaceView HAS owned the native window. Once true the layer
+      *  answer never falls back to the legacy above-window slot (0), even after the
+      *  owner has been collected: a destroyed SurfaceView's surface must not jump
+@@ -1728,8 +1730,10 @@
+      *  performDrawFinished marks; like it, ask the tree to redraw so the hole
+      *  appears (performDrawFinished's invalidate(); posted, as this can run on the
+      *  producer's thread). */
+-    static void macapkNoteNativeWindowOwner(SurfaceView owner) {
++    static synchronized void macapkNoteNativeWindowOwner(SurfaceView owner) {
+         if (!sGuestBelowGate || owner == null) return;
++        sNativeWindowControl = null;
++        sNativeWindowControlHidden = false;
+         java.lang.ref.WeakReference<SurfaceView> prevRef = sNativeWindowOwner;
+         SurfaceView prev = prevRef != null ? prevRef.get() : null;
+         sNativeWindowOwner = new java.lang.ref.WeakReference<>(owner);
+@@ -1749,7 +1753,22 @@
+         }
+     }
+ 
++    static synchronized void macapkNoteControlledNativeWindowOwner(SurfaceView owner, Object control) {
++        if (!sGuestBelowGate) return;
++        if (owner == null) {
++            if (sNativeWindowControl != null && sNativeWindowControl.get() == control) {
++                sNativeWindowControlHidden = true;
++                SurfaceView previous = sNativeWindowOwner == null ? null : sNativeWindowOwner.get();
++                if (previous != null) try { previous.postInvalidate(); } catch (Throwable ignored) { }
++            }
++            return;
++        }
++        macapkNoteNativeWindowOwner(owner);
++        sNativeWindowControl = new java.lang.ref.WeakReference<>(control);
++    }
++
+     private boolean macapkIsNativeWindowOwner() {
++        if (sNativeWindowControlHidden) return false;
+         java.lang.ref.WeakReference<SurfaceView> ref = sNativeWindowOwner;
+         return ref != null && ref.get() == this;
+     }
+@@ -1765,6 +1784,7 @@
+      *  cocoa_bridge.mm macapk_guest_layer_z_for maps the answer to a zPosition. */
+     public static int macapkNativeWindowLayerZ() {
+         if (!sGuestBelowGate) return 0;
++        if (sNativeWindowControlHidden) return -1;
+         java.lang.ref.WeakReference<SurfaceView> ref = sNativeWindowOwner;
+         SurfaceView v = ref != null ? ref.get() : null;
+         if (v == null) return sHadNativeWindowOwner ? 1 : 0;

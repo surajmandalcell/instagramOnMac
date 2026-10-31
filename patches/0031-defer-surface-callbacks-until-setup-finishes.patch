@@ -1,0 +1,75 @@
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -3838,6 +3838,8 @@
+             surface.macapkSetOwnerSurfaceView(owner);
+         }
+         private final java.util.ArrayList<Callback> callbacks = new java.util.ArrayList<>();
++        private final java.util.IdentityHashMap<Callback, Object> callbackRegistrations = new java.util.IdentityHashMap<>();
++        private long surfaceGeneration;
+         private final android.view.Surface surface = new android.view.Surface();
+         private final android.graphics.Rect frame = new android.graphics.Rect();
+         // Persistent backing bitmap. lockCanvas() returns a Canvas
+@@ -3850,8 +3852,15 @@
+         private android.graphics.Canvas drawCanvas;
+ 
+         @Override public void addCallback(Callback cb) {
+-            if (cb == null || callbacks.contains(cb)) return;  // AOSP dedupes
+-            callbacks.add(cb);
++            if (cb == null) return;
++            Object registration = new Object();
++            long generation;
++            synchronized (callbacks) {
++                if (callbacks.contains(cb)) return;
++                callbacks.add(cb);
++                callbackRegistrations.put(cb, registration);
++                generation = surfaceGeneration;
++            }
+             // v1.0.572: retroactive delivery. Our surface is live from the
+             // first drawInMTKView, so a callback registered AFTER the
+             // (single-shot) surfaceCreated dispatch would otherwise never
+@@ -3860,19 +3869,27 @@
+             // retro-firing here reconstructs the ordering guarantee the app
+             // was written against rather than inventing new behavior.
+             if (owner != null && owner.holderSurfaceCreatedFired) {
+-                NativeLog.i(TAG, "addCallback after surfaceCreated: retro-"
+-                    + "delivering to " + cb.getClass().getName());
+-                try {
+-                    cb.surfaceCreated(this);
+-                    if (frame.width() > 0 && frame.height() > 0) {
+-                        cb.surfaceChanged(this, 0, frame.width(), frame.height());
++                // Keep callback delivery after the caller finishes installing
++                // its consumers, as with a traversal on Android's main queue.
++                macapkPostToUiThread(() -> {
++                    synchronized (callbacks) {
++                        if (callbackRegistrations.get(cb) != registration || surfaceGeneration != generation
++                                || !owner.holderSurfaceCreatedFired) return;
+                     }
+-                } catch (Throwable t) {
+-                    NativeLog.e(TAG, "retroactive surfaceCreated threw: " + t);
+-                }
++                    try {
++                        cb.surfaceCreated(this);
++                        if (frame.width() > 0 && frame.height() > 0)
++                            cb.surfaceChanged(this, 0, frame.width(), frame.height());
++                    } catch (Throwable t) { NativeLog.e(TAG, "queued surfaceCreated threw: " + t); }
++                });
+             }
+         }
+-        @Override public void removeCallback(Callback cb) { callbacks.remove(cb); }
++        @Override public void removeCallback(Callback cb) {
++            synchronized (callbacks) {
++                int index = callbacks.indexOf(cb);
++                if (index >= 0) callbackRegistrations.remove(callbacks.remove(index));
++            }
++        }
+         @Override public boolean isCreating()            { return false; }
+         @Override public android.view.Surface getSurface() { return surface; }
+         @Override public android.graphics.Rect getSurfaceFrame() { return frame; }
+@@ -4012,6 +4029,7 @@
+             for (Callback c : new java.util.ArrayList<>(callbacks)) c.surfaceChanged(this, format, w, h);
+         }
+         void fireDestroyed() {
++            synchronized (callbacks) { surfaceGeneration++; }
+             if (macapkCallbackOffUiThread()) {
+                 macapkPostToUiThread(() -> {
+                     try {

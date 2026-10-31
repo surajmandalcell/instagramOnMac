@@ -1,0 +1,466 @@
+--- a/runtime/java/android/media/MediaPlayer.java
++++ b/runtime/java/android/media/MediaPlayer.java
+@@ -34,7 +34,18 @@
+         return looper == null ? null : new android.os.Handler(looper);
+     }
+     private void postEvent(Runnable callback) { if (events != null) events.post(callback); }
+-    private String localSource;
++    private void dispatchError(int what, int extra) {
++        int version = generation;
++        boolean handled = false;
++        OnErrorListener listener = onError;
++        if (listener != null) {
++            try { handled = listener.onError(this, what, extra); } catch (Throwable ignored) {}
++        }
++        if (!handled && version == generation && onCompletion != null) {
++            try { onCompletion.onCompletion(this); } catch (Throwable ignored) {}
++        }
++    }
++    private volatile String localSource;
+     private volatile long videoHandle;
+     private volatile int generation;
+     private volatile int videoWidth, videoHeight, videoDuration;
+@@ -43,7 +54,24 @@
+     private volatile int videoSeekTarget;
+     private android.view.Surface videoSurface;
+     private Thread videoWorker;
+-    private boolean videoFirstFrameSent;
++    private volatile boolean videoFirstFrameSent;
++    public enum PreparationState { IDLE, PREPARING, PREPARED, FAILED }
++    public static final long MACAPK_VIDEO_PREPARATION_TIMEOUT_MS = 660_000L;
++    private volatile PreparationState preparationState = PreparationState.IDLE;
++    private volatile long preparationAttempt;
++    public PreparationState macapkPreparationState() { return preparationState; }
++    public boolean macapkHasRenderedVideoFrame() { return videoFirstFrameSent; }
++    public boolean macapkSourceMatches(String requested) {
++        if (java.util.Objects.equals(localSource, requested)) return true;
++        if (com.macapk.loader.MovCompatibilityCache.sameSelectedSource(localSource, requested)) return true;
++        String original = com.macapk.loader.DocumentPickerHandler.macapkReadOnlySelectedMedia(localSource);
++        String incoming = com.macapk.loader.DocumentPickerHandler.macapkReadOnlySelectedMedia(requested);
++        return original != null && original.equals(incoming);
++    }
++    public boolean macapkCanReplacePreparingSource(String requested) {
++        if (preparationState != PreparationState.PREPARING) return true;
++        return !macapkSourceMatches(requested);
++    }
+     private static native long nativeVideoOpen(String path);
+     private static native long[] nativeVideoInfo(long player);
+     private static native long[] nativeVideoFrame(long player);
+@@ -152,31 +180,77 @@
+ 
+     public void prepare() {
+         com.macapk.loader.AudioTrace.hit("MediaPlayer.prepare");
+-        if (localSource != null) {
+-            final int version = generation;
++        int version = generation;
++        long attempt = beginPreparation();
++        runPreparation(version, attempt);
++    }
++    private long beginPreparation() {
++        synchronized (videoLock) {
++            prepared = false;
++            preparationState = PreparationState.PREPARING;
++            return ++preparationAttempt;
++        }
++    }
++    private boolean currentPreparation(int version, long attempt) {
++        return version == generation && attempt == preparationAttempt;
++    }
++    private void runPreparation(int version, long attempt) {
++        try { prepareSource(version, attempt); }
++        catch (Exception | LinkageError failed) {
++            if (currentPreparation(version, attempt)) prepared = false;
++        } finally {
++            synchronized (videoLock) {
++                if (currentPreparation(version, attempt)) {
++                    preparationState = prepared ? PreparationState.PREPARED : PreparationState.FAILED;
++                    if (!prepared && videoHandle != 0) { nativeVideoClose(videoHandle); videoHandle = 0; }
++                }
++            }
++        }
++    }
++    private void prepareSource(int version, long attempt) throws Exception {
++        if (!currentPreparation(version, attempt)) return;
++        String source = localSource;
++        if (source != null) {
++            // Conversion is shared and can outlive this player. Wait without
++            // videoLock, and cancel only this generation's wait on reset/rebind.
++            java.util.concurrent.CompletableFuture<String> conversion = android.provider.MediaStoreProvider.macapkPrepareSelectedVideo(source);
++            String playable = null;
++            long conversionDeadline = System.nanoTime() + MACAPK_VIDEO_PREPARATION_TIMEOUT_MS * 1_000_000L;
++            while (currentPreparation(version, attempt) && System.nanoTime() < conversionDeadline) {
++                try { playable = conversion.get(100, java.util.concurrent.TimeUnit.MILLISECONDS); break; }
++                catch (java.util.concurrent.TimeoutException pending) { }
++            }
++            if (!currentPreparation(version, attempt)) return;
++            if (playable == null) throw new java.io.IOException("Video preparation timed out");
+             synchronized (videoLock) {
++                if (!currentPreparation(version, attempt)) return;
+                 videoFirstFrameSent = false;
+                 if (videoHandle != 0) nativeVideoClose(videoHandle);
+-                videoHandle = nativeVideoOpen(localSource);
++                long opened = nativeVideoOpen(playable);
++                if (!currentPreparation(version, attempt)) {
++                    if (opened != 0) nativeVideoClose(opened);
++                    return;
++                }
++                videoHandle = opened;
+                 if (videoHandle != 0) {
+                     nativeVideoCommand(videoHandle, 4, (volL + volR) * .5 * mShaperScale);
+                 }
+             }
+             long deadline = System.nanoTime() + 10_000_000_000L;
+-            while (version == generation && System.nanoTime() < deadline) {
++            while (currentPreparation(version, attempt) && System.nanoTime() < deadline) {
+                 long[] info;
+                 synchronized (videoLock) { info = videoHandle == 0 ? null : nativeVideoInfo(videoHandle); }
+                 if (info == null || info[3] < 0) break;
+                 if (info[3] == 1 && info[0] > 0 && info[1] > 0) {
+                     synchronized (videoLock) {
+-                        if (version != generation || videoHandle == 0) return;
++                        if (!currentPreparation(version, attempt) || videoHandle == 0) return;
+                         videoWidth = (int)info[0]; videoHeight = (int)info[1]; videoDuration = (int)info[2];
+                         prepared = true; return;
+                     }
+                 }
+                 try { Thread.sleep(10); } catch (InterruptedException stopped) { Thread.currentThread().interrupt(); break; }
+             }
+-            synchronized (videoLock) { if (version == generation) prepared = false; }
++            synchronized (videoLock) { if (currentPreparation(version, attempt)) prepared = false; }
+             return;
+         }
+         ensureHandle();
+@@ -192,12 +266,13 @@
+     public void prepareAsync() {
+         com.macapk.loader.AudioTrace.hit("MediaPlayer.prepareAsync");
+         final int version = generation;
++        final long attempt = beginPreparation();
+         new Thread(new Runnable() {
+             @Override public void run() {
+-                if (version != generation) return;
+-                prepare();
++                if (!currentPreparation(version, attempt)) return;
++                runPreparation(version, attempt);
+                 postEvent(() -> {
+-                if (version != generation) return;
++                if (!currentPreparation(version, attempt)) return;
+                 if (prepared) {
+                     if (videoWidth > 0 && onVideoSizeChanged != null)
+                         onVideoSizeChanged.onVideoSizeChanged(MediaPlayer.this, videoWidth, videoHeight);
+@@ -217,11 +292,7 @@
+                     // with no signal at all: the worst failure shape this
+                     // project tracks. Fire onError so the app's error path
+                     // (skip track, show a message, retry) actually runs.
+-                    OnErrorListener el = onError;
+-                    if (el != null) {
+-                        try { el.onError(MediaPlayer.this, MEDIA_ERROR_UNKNOWN, 0); }
+-                        catch (Throwable ignore) {}
+-                    }
++                    dispatchError(MEDIA_ERROR_UNKNOWN, 0);
+                 }
+                 });
+             }
+@@ -239,11 +310,14 @@
+         String path = com.macapk.loader.DocumentPickerHandler.macapkVideoPath(fd);
+         if (path == null || offset != 0 || length < new java.io.File(path).length()
+                 || com.macapk.loader.DocumentPickerHandler.macapkReadVideoMetadata(path) == null) return false;
+-        localSource = path; pendingSource = null; return true;
++        String selected = com.macapk.loader.DocumentPickerHandler.macapkReadOnlySelectedMedia(path);
++        localSource = selected != null ? selected : path; pendingSource = null; return true;
+     }
+ 
+     private void closeVideo() {
+         generation++; videoPlaying = false; videoSeekPending = false;
++        preparationAttempt++;
++        preparationState = PreparationState.IDLE;
+         synchronized (videoLock) {
+             if (videoHandle != 0) { nativeVideoClose(videoHandle); videoHandle = 0; }
+             videoWidth = videoHeight = videoDuration = 0;
+@@ -290,7 +364,7 @@
+                         }
+                         if (info != null && info[3] < 0) {
+                             videoPlaying = false;
+-                            postEvent(() -> { if (version == generation && onError != null) onError.onError(this, MEDIA_ERROR_UNKNOWN, 0); });
++                            postEvent(() -> { if (version == generation) dispatchError(MEDIA_ERROR_UNKNOWN, 0); });
+                             return;
+                         }
+                         if (videoSeekPending && frame != null && info != null && info[5] == 0
+--- a/runtime/java/android/media/MediaExtractor.java
++++ b/runtime/java/android/media/MediaExtractor.java
+@@ -34,6 +34,7 @@
+         refreshCurrent();
+     }
+     private void openNativeSource(String path) {
++        path = android.provider.MediaStoreProvider.macapkReadySelectedVideo(path);
+         mExtractorHandle = com.macapk.loader.NativeMedia.nativeExtractorOpen(path);
+         if (mExtractorHandle == 0) mHandle = com.macapk.loader.NativeMedia.nativeDemuxOpen(path);
+     }
+--- a/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
++++ b/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
+@@ -40,6 +40,7 @@
+         return mainHandler;
+     }
+     private static final Map<View, Boolean> FAILURE_POSTED = new WeakHashMap<>();
++    private static final Map<Context, Boolean> SUPPORTED_CONTEXTS = new WeakHashMap<>();
+ 
+     private static Activity editorActivity;
+     private static volatile ViewGroup editorRoot;
+@@ -51,9 +52,39 @@
+     private static int state = IDLE;
+     private static long generation;
+     private static boolean rendererFailed;
++    private static final GalleryStatus GALLERY = new GalleryStatus();
+ 
+     private InstagramMediaPreparationCompat() {}
+ 
++    /** A new explicit selection must not be discarded by a stale preparing view.
++     * Use the view's own teardown, then continue its unchanged normal bind path. */
++    public static void prepareVideoSource(Object candidate, String requested) {
++        if (!(candidate instanceof View view) || !supportedContext(view.getContext())
++                || !DocumentPickerHandler.macapkIsSelectedMediaReference(requested)) return;
++        try {
++            Class<?> type = candidate.getClass();
++            while (type != null && !"X.S9Y".equals(type.getName())) type = type.getSuperclass();
++            if (type == null || !(declaredField(candidate, "X.S9Y", "A03") instanceof Enum<?> state)
++                    || !"PREPARING".equals(state.name())) return;
++            Object raw = declaredField(candidate, "X.S9Y", "A00");
++            if (!(raw instanceof android.media.MediaPlayer player)
++                    || !player.macapkCanReplacePreparingSource(requested)) return;
++            type.getDeclaredMethod("A02").invoke(candidate);
++        } catch (ReflectiveOperationException | RuntimeException unavailable) { }
++    }
++
++    private static boolean supportedContext(Context context) {
++        if (context == null || !PACKAGE.equals(context.getPackageName())) return false;
++        synchronized (SUPPORTED_CONTEXTS) {
++            Boolean known = SUPPORTED_CONTEXTS.get(context); if (known != null) return known;
++        }
++        boolean supported;
++        try { supported = VERSION.equals(context.getPackageManager().getPackageInfo(PACKAGE, 0).versionName); }
++        catch (android.content.pm.PackageManager.NameNotFoundException absent) { supported = false; }
++        synchronized (SUPPORTED_CONTEXTS) { SUPPORTED_CONTEXTS.put(context, supported); }
++        return supported;
++    }
++
+     /** Called once from the root View draw path; false means the editor is still starting. */
+     public static boolean onRootDraw(View view) {
+         if (view == null || view.getRootView() != view) return true;
+@@ -154,6 +185,7 @@
+     public static void onRootDetached(View view) {
+         runOnMain(() -> {
+             if (editorRoot == view) clearState();
++            if (GALLERY.root == view) GALLERY.clear();
+         });
+     }
+ 
+@@ -164,8 +196,10 @@
+         if (top == null) return false;
+         if (!isEditorRoute(top)) {
+             clearState();
++            GALLERY.update(top, view);
+             return false;
+         }
++        GALLERY.clear();
+         Activity activity = targetEditor(top);
+         if (activity == null) {
+             return false;
+@@ -352,6 +386,126 @@
+             return true;
+         }
+         return mainHandler().post(action);
++    }
++
++    /** The gallery uses its selected item, not an account list or media scan. */
++    private static final class GalleryStatus {
++        ViewGroup root;
++        View picker;
++        View preview;
++        String alias;
++        int phase;
++        long deadline;
++        boolean timedOut;
++        LinearLayout panel;
++        TextView message;
++        ProgressBar progress;
++
++        void update(Activity activity, View drawRoot) {
++            if (activity == null || !"com.instagram.creation.activity.MediaCaptureActivity".equals(activity.getClass().getName())
++                    || !supportedContext(activity) || activity.getWindow() == null
++                    || activity.getWindow().getDecorView() != drawRoot || !(drawRoot instanceof ViewGroup group)) {
++                clear(); return;
++            }
++            try {
++                if (root != group || picker == null || picker.getRootView() != group) {
++                    clear(); root = group; picker = find(group, "X.D3A");
++                }
++                if (picker == null || !picker.isShown() || !intersectsViewport(picker, group)) { clear(); return; }
++                Object item = declaredField(picker, "X.D3A", "A0D");
++                Object medium = item == null ? null : field(item, "A02");
++                if (medium == null || !"com.instagram.common.gallery.Medium".equals(medium.getClass().getName())
++                        || ((Number)field(medium, "A0A")).intValue() != 3) { clear(); return; }
++                String selected = (String)field(medium, "A0e");
++                if (!DocumentPickerHandler.macapkIsSelectedMediaReference(selected)) { clear(); return; }
++                if (!selected.equals(alias)) { remove(); alias = selected; phase = 0; deadline = 0; preview = null; timedOut = false; }
++                if (preview == null || preview.getRootView() != group) preview = find(picker, "X.S9Y");
++                android.media.MediaPlayer player = preview == null ? null : (android.media.MediaPlayer)declaredField(preview, "X.S9Y", "A00");
++                MovCompatibilityCache.Snapshot conversion = MovCompatibilityCache.snapshotForSelectedData(alias);
++                boolean converting = conversion != null && (conversion.state() == MovCompatibilityCache.State.WAITING
++                        || conversion.state() == MovCompatibilityCache.State.RUNNING);
++                boolean failed = conversion != null && conversion.state() == MovCompatibilityCache.State.FAILED;
++                if (!converting && !failed && player != null && player.macapkSourceMatches(alias)
++                        && player.macapkHasRenderedVideoFrame()) { remove(); phase = 0; return; }
++                failed |= player != null && player.macapkSourceMatches(alias)
++                        && player.macapkPreparationState() == android.media.MediaPlayer.PreparationState.FAILED;
++                failed |= timedOut;
++                int next = failed ? 3 : converting ? 1 : 2;
++                long now = android.os.SystemClock.uptimeMillis();
++                if (phase != next) { phase = next; deadline = now + (converting
++                        ? android.media.MediaPlayer.MACAPK_VIDEO_PREPARATION_TIMEOUT_MS : 15_000L); remove(); }
++                if (next != 3 && now >= deadline) { timedOut = true; phase = 3; next = 3; remove(); }
++                int percent = conversion == null ? 0 : (int)Math.max(0, Math.min(100, conversion.fraction() * 100));
++                String label = next == 3 ? "Video could not be prepared." : converting
++                        ? "Converting video… " + percent + "%" : "Preparing video preview…";
++                show(activity, label, converting ? percent : -1, next == 3);
++            } catch (ReflectiveOperationException | RuntimeException unavailable) { clear(); }
++        }
++
++        private static View find(View start, String name) {
++            java.util.ArrayDeque<View> pending = new java.util.ArrayDeque<>(); pending.add(start);
++            for (int visited = 0; !pending.isEmpty() && visited < 4096; visited++) {
++                View view = pending.removeFirst();
++                for (Class<?> type = view.getClass(); type != null; type = type.getSuperclass())
++                    if (name.equals(type.getName())) return view;
++                if (view instanceof ViewGroup children)
++                    for (int i = 0; i < children.getChildCount(); i++) pending.addLast(children.getChildAt(i));
++            }
++            return null;
++        }
++
++        private static boolean intersectsViewport(View picker, View root) {
++            if (picker.getWidth() <= 0 || picker.getHeight() <= 0 || picker.getAlpha() <= 0) return false;
++            int[] origin = new int[2], point = new int[2];
++            root.getLocationInWindow(origin); picker.getLocationInWindow(point);
++            android.graphics.Rect bounds = new android.graphics.Rect(point[0], point[1],
++                    point[0] + picker.getWidth(), point[1] + picker.getHeight());
++            return bounds.intersect(origin[0], origin[1], origin[0] + root.getWidth(), origin[1] + root.getHeight())
++                    && picker.getGlobalVisibleRect(new android.graphics.Rect());
++        }
++
++        void show(Activity activity, String text, int percent, boolean failed) {
++            if (panel == null) {
++                panel = new LinearLayout(activity); panel.setOrientation(LinearLayout.VERTICAL);
++                panel.setPadding(dp(activity, 16), dp(activity, 12), dp(activity, 16), dp(activity, 12));
++                panel.setBackground(background(activity));
++                panel.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
++                progress = new ProgressBar(activity); progress.setContentDescription("Preparing selected video");
++                if (!failed) panel.addView(progress, new LinearLayout.LayoutParams(dp(activity, 24), dp(activity, 24)));
++                message = new TextView(activity); message.setTextColor(TEXT); message.setTextSize(14);
++                message.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE); panel.addView(message);
++                if (failed && preview != null) {
++                    Button retry = new Button(activity); retry.setText("Retry"); retry.setAllCaps(false);
++                    retry.setOnClickListener(ignored -> retry()); panel.addView(retry);
++                }
++                Button back = new Button(activity); back.setText("Back"); back.setAllCaps(false);
++                back.setOnClickListener(ignored -> { activity.onBackPressed(); clear(); }); panel.addView(back);
++                int width = Math.min(root.getWidth() - dp(activity, 32), dp(activity, 340));
++                FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width > 0 ? width : -2, -2,
++                        Gravity.TOP | Gravity.CENTER_HORIZONTAL); params.topMargin = dp(activity, 72);
++                root.addView(panel, params);
++            }
++            message.setText(text); message.setContentDescription(text);
++            progress.setIndeterminate(percent <= 0); if (percent >= 0) { progress.setMax(100); progress.setProgress(percent); }
++        }
++
++        void retry() {
++            try {
++                Object callback = declaredField(preview, "X.S9Y", "A02");
++                if (callback == null) return;
++                for (Method method : preview.getClass().getMethods())
++                    if ("setVideoPath".equals(method.getName()) && method.getParameterCount() == 2
++                            && method.getParameterTypes()[0] == String.class) {
++                        method.invoke(preview, alias, callback); phase = 0; timedOut = false; remove(); return;
++                    }
++            } catch (ReflectiveOperationException | RuntimeException unavailable) { }
++        }
++
++        void remove() {
++            if (panel != null && panel.getParent() instanceof ViewGroup parent) parent.removeView(panel);
++            panel = null; message = null; progress = null;
++        }
++        void clear() { remove(); root = null; picker = preview = null; alias = null; phase = 0; deadline = 0; timedOut = false; }
+     }
+ 
+     private static Activity targetEditor(Activity activity) {
+@@ -390,8 +544,16 @@
+         }
+     }
+ 
+-    private static Object field(Object object, String name) throws Exception {
++    private static Object declaredField(Object object, String owner, String name) throws ReflectiveOperationException {
+         for (Class<?> type = object.getClass(); type != null; type = type.getSuperclass()) {
++            if (!owner.equals(type.getName())) continue;
++            Field field = type.getDeclaredField(name); field.setAccessible(true); return field.get(object);
++        }
++        throw new NoSuchFieldException(owner + "." + name);
++    }
++
++    private static Object field(Object object, String name) throws ReflectiveOperationException {
++        for (Class<?> type = object.getClass(); type != null; type = type.getSuperclass()) {
+             try {
+                 Field f = type.getDeclaredField(name);
+                 f.setAccessible(true);
+--- a/runtime/java/com/macapk/loader/ClassFileRewriter.java
++++ b/runtime/java/com/macapk/loader/ClassFileRewriter.java
+@@ -177,8 +177,9 @@
+         boolean selectedMedium = matchesSelectedMedium(raw, className);
+         boolean selectedGallery = matchesSelectedGallery(raw, className);
+         boolean selectedMetadata = matchesSelectedMetadata(raw, className);
++        boolean selectedPreview = matchesSelectedPreview(raw, className);
+         if (PRESCAN_ENABLED) {
+-            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || needsFullParse(raw, className);
++            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || selectedPreview || needsFullParse(raw, className);
+             if (PRESCAN_STATS) {
+                 long seen = prescanSeen.incrementAndGet();
+                 if (needsParse) prescanFullParsed.incrementAndGet();
+@@ -479,6 +480,13 @@
+                         hits += redirectSelectedMetadata(cf, m.code);
+                 }
+             }
++            if (selectedPreview) {
++                for (MethodEntry m : cf.methods) {
++                    if (m.code != null && "setVideoPath".equals(cf.utf8(m.nameIndex))
++                            && "(Ljava/lang/String;LX/rBz;)V".equals(cf.utf8(m.descIndex)))
++                        hits += redirectSelectedPreview(cf, m.code);
++                }
++            }
+             if (hits > 0) {
+                 byte[] out = cf.serialize();
+                 if (DEBUG) {
+@@ -1123,7 +1131,27 @@
+         if (fingerprint == null) return false;
+         try { return fingerprint.equals(java.util.HexFormat.of().formatHex(
+                 java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
++        } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
++    }
++
++    private static boolean matchesSelectedPreview(byte[] raw, String name) {
++        if (!"X.S9Y".equals(name) && !"X/S9Y".equals(name)) return false;
++        try { return "0f9c88e6fda248bae689cbae935fdb88932e57d3c409d8eb955a6e76ab7fe433".equals(
++                java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
+         } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
++    }
++
++    private static int redirectSelectedPreview(ClassFile cf, CodeAttr code) {
++        int start = code.codeOffset;
++        // Unused numeric initializers; both locals are overwritten before use.
++        if (code.codeLen < 5 || code.code[start] != 3 || code.code[start+1] != 0x3e
++                || code.code[start+2] != 0x0b || code.code[start+3] != 0x38 || code.code[start+4] != 4) return 0;
++        int owner = cf.findOrAddClass("com/macapk/loader/InstagramMediaPreparationCompat");
++        int type = cf.findOrAddNameAndType("prepareVideoSource", "(Ljava/lang/Object;Ljava/lang/String;)V");
++        int method = cf.findOrAddMethodref(owner, type);
++        code.code[start] = 0x2a; code.code[start+1] = 0x2b;
++        code.code[start+2] = (byte)OP_INVOKESTATIC; writeU2(code.code,start+3,method);
++        return 1;
+     }
+ 
+     private static int redirectSelectedMetadata(ClassFile cf, CodeAttr code) {

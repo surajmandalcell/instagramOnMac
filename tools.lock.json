@@ -1,0 +1,15 @@
+{
+  "signer_source_url": "https://www.instagram.com/.well-known/assetlinks.json",
+  "instagram_signers_sha256": [
+    "5f3e50f435583c9ae626302a71f7340044087a7e2c60adacfc254205a993e305",
+    "3a10c50c18ba937506c2875e9047be74f8fd8b86fae2ff9feaa50a81fcb4c014"
+  ],
+  "apksig": {
+    "url": "https://dl.google.com/dl/android/maven2/com/android/tools/build/apksig/8.7.3/apksig-8.7.3.jar",
+    "sha256": "c070ed1394629d74641aa0906f60b2ffa1ee77e6366a1f93437f59717b1aeb89"
+  },
+  "aapt2": {
+    "url": "https://dl.google.com/dl/android/maven2/com/android/tools/build/aapt2/8.7.3-12006047/aapt2-8.7.3-12006047-osx.jar",
+    "sha256": "8cfca8d3fcb8ad45cf46e3780cdd4a64cb38c70ca45b442655de9f3e7d19efc1"
+  }
+}

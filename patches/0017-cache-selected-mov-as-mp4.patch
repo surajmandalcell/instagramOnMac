@@ -1,0 +1,287 @@
+--- a/runtime/java/android/provider/MediaStoreProvider.java
++++ b/runtime/java/android/provider/MediaStoreProvider.java
+@@ -366,7 +366,7 @@
+ 
+     public MediaStoreProvider() {}
+ 
+-    /** Remember an explicitly chosen original. No media bytes are copied. */
++    /** Remember an explicitly chosen original; derived playback lives in a separate cache. */
+     public static Uri macapkImportMedia(android.content.Context context, File source) throws IOException {
+         if (context == null || source == null || !source.isFile() || !source.canRead()) return null;
+         String name = source.getName();
+@@ -381,15 +381,48 @@
+         String alias = com.macapk.loader.DocumentPickerHandler.macapkReadOnlySelectedMedia(original.getPath());
+         if (alias == null)
+             throw new IOException("Read-only selected-file protection is unavailable");
++        if (com.macapk.loader.MovCompatibilityCache.needsConversion(original)) {
++            com.macapk.loader.MovCompatibilityCache.prepare(context, original, alias);
++        }
+         String owner = context.getPackageName();
+         {
+             Uri uri = ((MediaStoreProvider) registered).indexHostImport(original, alias, owner, kind);
++            com.macapk.loader.MovCompatibilityCache.bindUri(uri, alias);
+             android.content.ContentResolver resolver = context.getContentResolver();
+             resolver.notifyChange(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null);
+             resolver.notifyChange(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, null);
+             resolver.notifyChange(MediaStore.Files.getContentUri("external"), null);
+             return uri;
+         }
++    }
++
++    /** Read-only ready lookup. Never starts or waits for a conversion. */
++    public static String macapkReadySelectedVideo(String alias) {
++        return com.macapk.loader.MovCompatibilityCache.readyAliasForSelectedData(alias);
++    }
++
++    /** Called on the player's preparation worker, never from a gallery query. */
++    public static java.util.concurrent.CompletableFuture<String> macapkPrepareSelectedVideo(String alias) {
++        if (alias == null || !com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(alias))
++            return java.util.concurrent.CompletableFuture.completedFuture(alias);
++        android.content.ContentProvider registered = android.content.ContentProviderRegistry.get(MediaStore.AUTHORITY);
++        if (!(registered instanceof MediaStoreProvider provider) || provider.mDb == null)
++            return java.util.concurrent.CompletableFuture.completedFuture(alias);
++        try (Cursor row = provider.mDb.rawQuery("SELECT r.original_path, r.media_id FROM " + SELECTED_TABLE
++                + " r JOIN " + TABLE + " f ON f._id=r.media_id WHERE f._data=? AND r.ready=1", new String[]{alias})) {
++            if (!row.moveToFirst()) return java.util.concurrent.CompletableFuture.completedFuture(alias);
++            File original = new File(row.getString(0));
++            if (!com.macapk.loader.MovCompatibilityCache.needsConversion(original)) return java.util.concurrent.CompletableFuture.completedFuture(alias);
++            var future = com.macapk.loader.MovCompatibilityCache.prepare(provider.getContext(), original, alias);
++            com.macapk.loader.MovCompatibilityCache.bindUri(android.content.ContentUris.withAppendedId(
++                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI, row.getLong(1)), alias);
++            return future.thenApply(output -> {
++                String derived = com.macapk.loader.DocumentPickerHandler.macapkReadOnlySelectedMedia(output.getPath());
++                if (derived == null) throw new java.util.concurrent.CompletionException(new IOException("Converted video could not be opened read only"));
++                com.macapk.loader.MovCompatibilityCache.bindAlias(alias, derived);
++                return derived;
++            });
++        } catch (Throwable failure) { return java.util.concurrent.CompletableFuture.failedFuture(failure); }
+     }
+ 
+     private Uri indexHostImport(File original, String alias, String owner, int kind) throws IOException {
+@@ -526,7 +559,7 @@
+         try (Cursor row = provider.query(uri, new String[]{COL_DATA}, null, null, null)) {
+             if (row != null && row.moveToFirst()) {
+                 String alias = row.getString(0);
+-                if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(alias)) return alias;
++                if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(alias)) return macapkReadySelectedVideo(alias);
+             }
+         }
+         return fallback;
+@@ -535,6 +568,7 @@
+     /** Native format readers open their own descriptor; give each initialization
+      * an independent read-only cursor instead of the registry's anchor cursor. */
+     public static void macapkInitializeSelectedRetriever(Object retriever, String path) throws Throwable {
++        path = macapkReadySelectedVideo(path);
+         if (retriever == null || !"com.facebook.ffmpeg.FFMpegMediaMetadataRetriever".equals(retriever.getClass().getName()))
+             throw new IllegalArgumentException("Unexpected metadata reader");
+         java.lang.reflect.Method initialize = retriever.getClass().getDeclaredMethod("nativeInit", String.class);
+@@ -1314,7 +1348,7 @@
+         if (!f.exists()) throw new FileNotFoundException(path);
+         if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(path)) {
+             if (modeWantsWrite(pfdMode)) throw new SecurityException("no write access to selected reference");
+-            return com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(path);
++            return com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(macapkReadySelectedVideo(path));
+         }
+         if (selectedOnlyCaller()) throw new FileNotFoundException("Selected reference is unavailable");
+         return ParcelFileDescriptor.open(f, pfdMode);
+--- a/runtime/java/com/macapk/loader/DocumentPickerHandler.java
++++ b/runtime/java/com/macapk/loader/DocumentPickerHandler.java
+@@ -559,6 +559,10 @@
+      *  whose native side lacks it throws UnsatisfiedLinkError, which handle()
+      *  turns into a cancel. Asynchronous: returns once the panel is scheduled;
+      *  the answer arrives through macapkOnPicked. */
++    public static String macapkConvertMov(String source, String output, java.util.function.DoubleConsumer progress) {
++        return nativeConvertMov(source, output, progress);
++    }
++    private static native String nativeConvertMov(String source, String output, java.util.function.DoubleConsumer progress);
+     private static native boolean nativePick(boolean save, boolean multiple, String[] mimeTypes,
+                                              String suggestedName, long id);
+     private static native long[] nativeVideoMetadata(String path);
+--- a/runtime/java/com/macapk/loader/MovCompatibilityCache.java
++++ b/runtime/java/com/macapk/loader/MovCompatibilityCache.java
+@@ -0,0 +1,121 @@
++package com.macapk.loader;
++
++import android.content.Context;
++import android.net.Uri;
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.StandardCopyOption;
++import java.nio.file.attribute.BasicFileAttributes;
++import java.security.MessageDigest;
++import java.util.HexFormat;
++import java.util.Locale;
++import java.util.concurrent.*;
++
++/** One derived MP4 per explicitly selected source revision. Originals are read only. */
++public final class MovCompatibilityCache {
++    public enum State { WAITING, RUNNING, READY, FAILED }
++    public record Snapshot(State state, double fraction, String error) {}
++    private static final ConcurrentHashMap<String, Job> JOBS = new ConcurrentHashMap<>();
++    private static final ConcurrentHashMap<String, Job> ALIASES = new ConcurrentHashMap<>();
++    private static final ConcurrentHashMap<String, Job> URIS = new ConcurrentHashMap<>();
++    private static final ExecutorService WORKER = new ThreadPoolExecutor(1, 1, 0L,
++            TimeUnit.SECONDS, new ArrayBlockingQueue<>(16), task -> {
++                Thread thread = new Thread(task, "macapk-mov-conversion");
++                thread.setDaemon(true); return thread;
++            });
++    private static final class Job {
++        volatile Snapshot snapshot = new Snapshot(State.WAITING, 0, null);
++        final CompletableFuture<File> future = new CompletableFuture<>();
++    }
++    private MovCompatibilityCache() {}
++    public static boolean needsConversion(File file) {
++        return file != null && file.getName().toLowerCase(Locale.ROOT).endsWith(".mov");
++    }
++    public static Snapshot snapshotForSelectedData(String alias) {
++        Job job = alias == null ? null : ALIASES.get(alias); return job == null ? null : job.snapshot;
++    }
++    public static Snapshot snapshotForSelectedUri(Uri uri) {
++        Job job = uri == null ? null : URIS.get(uri.toString()); return job == null ? null : job.snapshot;
++    }
++    public static boolean sameSelectedSource(String first, String second) {
++        if (first == null || second == null) return false;
++        if (first.equals(second)) return true;
++        Job job = ALIASES.get(first); return job != null && job == ALIASES.get(second);
++    }
++    public static String readyAliasForSelectedData(String alias) {
++        Job job = alias == null ? null : ALIASES.get(alias);
++        if (job == null || job.snapshot.state() != State.READY) return alias;
++        File output = job.future.getNow(null);
++        if (output == null || !output.isFile() || output.length() == 0) return alias;
++        String derived = DocumentPickerHandler.macapkReadOnlySelectedMedia(output.getPath());
++        if (derived == null) return alias;
++        ALIASES.put(derived, job); return derived;
++    }
++    public static void bindUri(Uri uri, String alias) {
++        Job job = ALIASES.get(alias); if (uri != null && job != null) URIS.put(uri.toString(), job);
++    }
++    public static void bindAlias(String originalAlias, String derivedAlias) {
++        Job job = ALIASES.get(originalAlias); if (job != null && derivedAlias != null) ALIASES.put(derivedAlias, job);
++    }
++    public static CompletableFuture<File> prepare(Context context, File original, String alias) throws IOException {
++        if (!needsConversion(original)) return CompletableFuture.completedFuture(original);
++        File canonical = original.getCanonicalFile();
++        BasicFileAttributes stat = Files.readAttributes(canonical.toPath(), BasicFileAttributes.class);
++        String identity = "mp4-v1\n" + (stat.fileKey() == null ? canonical.getPath() : stat.fileKey())
++                + "\n" + stat.size() + "\n" + stat.lastModifiedTime();
++        final String key;
++        try { key = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(identity.getBytes(StandardCharsets.UTF_8))); }
++        catch (java.security.NoSuchAlgorithmException unavailable) { throw new IOException(unavailable); }
++        Job fresh = new Job(); Job prior = JOBS.putIfAbsent(key, fresh); Job job = prior == null ? fresh : prior;
++        if (alias != null) ALIASES.put(alias, job);
++        if (prior != null) {
++            if (job.snapshot.state() == State.READY) {
++                File cached = job.future.getNow(null);
++                if (cached == null || !cached.isFile() || cached.length() == 0
++                        || DocumentPickerHandler.macapkReadVideoMetadata(cached.getPath()) == null) {
++                    JOBS.remove(key, job); return prepare(context, original, alias);
++                }
++            }
++            return job.future;
++        }
++        File directory = new File(context.getCacheDir(), "selected-mp4-v1");
++        try { WORKER.execute(() -> convert(job, canonical, alias, directory, key, stat)); }
++        catch (RejectedExecutionException busy) {
++            job.snapshot = new Snapshot(State.FAILED, 0, "Too many videos are preparing. Try again.");
++            job.future.completeExceptionally(new IOException(job.snapshot.error())); JOBS.remove(key, job);
++        }
++        return job.future;
++    }
++    private static void ownerOnly(java.nio.file.Path path, boolean directory) throws IOException {
++        if (Files.getFileStore(path).supportsFileAttributeView("posix"))
++            Files.setPosixFilePermissions(path, java.nio.file.attribute.PosixFilePermissions.fromString(directory ? "rwx------" : "rw-------"));
++    }
++    private static void convert(Job job, File original, String alias, File directory, String key, BasicFileAttributes before) {
++        File output = new File(directory, key + ".mp4"), part = new File(directory, key + ".part.mp4");
++        try {
++            Files.createDirectories(directory.toPath());
++            ownerOnly(directory.toPath(), true);
++            job.snapshot = new Snapshot(State.RUNNING, 0, null);
++            if (!output.isFile() || output.length() == 0 || DocumentPickerHandler.macapkReadVideoMetadata(output.getPath()) == null) {
++                Files.deleteIfExists(part.toPath());
++                String error = DocumentPickerHandler.macapkConvertMov(alias, part.getPath(), fraction ->
++                        job.snapshot = new Snapshot(State.RUNNING, Math.max(0, Math.min(1, fraction)), null));
++                if (error != null) throw new IOException(error);
++                BasicFileAttributes after = Files.readAttributes(original.toPath(), BasicFileAttributes.class);
++                if (!java.util.Objects.equals(before.fileKey(), after.fileKey()) || before.size() != after.size()
++                        || !before.lastModifiedTime().equals(after.lastModifiedTime())) throw new IOException("The selected file changed. Choose it again.");
++                if (DocumentPickerHandler.macapkReadVideoMetadata(part.getPath()) == null) throw new IOException("Converted video could not be read.");
++                ownerOnly(part.toPath(), false);
++                Files.move(part.toPath(), output.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
++            }
++            ownerOnly(output.toPath(), false);
++            job.snapshot = new Snapshot(State.READY, 1, null); job.future.complete(output);
++        } catch (Throwable failure) {
++            try { Files.deleteIfExists(part.toPath()); } catch (IOException ignored) {}
++            job.snapshot = new Snapshot(State.FAILED, 0, "Video conversion failed. Choose the file again.");
++            job.future.completeExceptionally(new IOException(job.snapshot.error(), failure)); JOBS.remove(key, job);
++        }
++    }
++}
+--- a/runtime/src/document_picker.mm
++++ b/runtime/src/document_picker.mm
+@@ -352,6 +352,8 @@
+   }
+     return JNI_TRUE;
+ }
++
++#include "mov_export.inc"
+ 
+ static jlongArray nativeVideoMetadata(JNIEnv* env, jclass, jstring path_j) {
+   @autoreleasepool {
+@@ -488,6 +490,10 @@
+                              " no tree picker or starting directory this run\n");
+     }
+     if (env->RegisterNatives(cls, &kVideoMetadata, 1) != JNI_OK) env->ExceptionClear();
++    JNINativeMethod convert = {const_cast<char*>("nativeConvertMov"),
++        const_cast<char*>("(Ljava/lang/String;Ljava/lang/String;Ljava/util/function/DoubleConsumer;)Ljava/lang/String;"),
++        reinterpret_cast<void*>(nativeConvertMov)};
++    if (env->RegisterNatives(cls, &convert, 1) != JNI_OK) env->ExceptionClear();
+     if (env->RegisterNatives(cls, &kVideoFrame, 1) != JNI_OK) env->ExceptionClear();
+     if (env->RegisterNatives(cls, &kVideoPath, 1) != JNI_OK) env->ExceptionClear();
+     if (env->RegisterNatives(cls, &kSelectedReadOnly, 1) != JNI_OK) env->ExceptionClear();
+--- a/runtime/src/mov_export.inc
++++ b/runtime/src/mov_export.inc
+@@ -0,0 +1,39 @@
++// Host-side derivation only; the selected source is never opened for writing.
++static jstring nativeConvertMov(JNIEnv* env, jclass, jstring source, jstring destination, jobject progress) {
++    @autoreleasepool {
++        NSString* path=mediaReadPath(jstr(env,source));
++        NSString* output=jstr(env,destination);
++        if(!path.length || !output.length)return env->NewStringUTF("Selected video is unavailable.");
++        AVURLAsset* asset=[AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
++        NSURL* url=[NSURL fileURLWithPath:output];
++        jclass consumer=progress?env->GetObjectClass(progress):nullptr;
++        jmethodID accept=consumer?env->GetMethodID(consumer,"accept","(D)V"):nullptr;
++        bool success=false;
++        double duration=CMTimeGetSeconds(asset.duration);
++        double budget=std::isfinite(duration)?std::max(120.0,std::min(600.0,duration*2.0+30.0)):120.0;
++        double deadline=CFAbsoluteTimeGetCurrent()+budget;
++        for(NSString* preset in @[AVAssetExportPresetPassthrough,AVAssetExportPresetHighestQuality]) {
++            if(CFAbsoluteTimeGetCurrent()>=deadline)break;
++            [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
++            AVAssetExportSession* session=[[AVAssetExportSession alloc] initWithAsset:asset presetName:preset];
++            if(!session || ![session.supportedFileTypes containsObject:AVFileTypeMPEG4])continue;
++            session.outputURL=url;session.outputFileType=AVFileTypeMPEG4;session.shouldOptimizeForNetworkUse=YES;
++            dispatch_semaphore_t done=dispatch_semaphore_create(0);
++            [session exportAsynchronouslyWithCompletionHandler:^{dispatch_semaphore_signal(done);}];
++            bool timedOut=false;
++            while(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,100*NSEC_PER_MSEC))!=0) {
++                if(accept){env->CallVoidMethod(progress,accept,(jdouble)session.progress);if(env->ExceptionCheck())env->ExceptionClear();}
++                if(CFAbsoluteTimeGetCurrent()>deadline){
++                    timedOut=true;[session cancelExport];
++                    dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));break;
++                }
++            }
++            success=session.status==AVAssetExportSessionStatusCompleted;
++            if(success||timedOut)break;
++        }
++        if(!success){if(consumer)env->DeleteLocalRef(consumer);[[NSFileManager defaultManager] removeItemAtURL:url error:nil];return env->NewStringUTF("Video conversion failed.");}
++        if(accept){env->CallVoidMethod(progress,accept,(jdouble)1);if(env->ExceptionCheck())env->ExceptionClear();}
++        if(consumer)env->DeleteLocalRef(consumer);
++        return nullptr;
++    }
++}

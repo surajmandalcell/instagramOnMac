@@ -1,0 +1,28 @@
+name: Source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AGENT_DATA_DIR: /tmp/source-checks
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check source and history for private data
+        run: python3 -B scripts/check_privacy.py
+      - name: Check workflow safety and release files
+        run: python3 -B -m unittest discover -s tests -p '*test*.py'
+      - name: Check patch whitespace
+        run: git diff --check

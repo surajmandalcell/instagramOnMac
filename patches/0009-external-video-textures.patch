@@ -1,0 +1,289 @@
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -14,6 +14,7 @@
+ #include "macapk/gles_bridge.h"
+ 
+ #include <atomic>
++#include <algorithm>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -36,6 +37,7 @@
+ #include <GLES2/gl2.h>
+ #include <GLES2/gl2ext.h>
+ #include "angle_glue.h"   // AngleMarkFrameWithheld
++#include "external_texture_bridge.h"
+ #endif
+ 
+ namespace macapk {
+@@ -1046,12 +1048,12 @@
+ }
+ void GLES20_glBindTexture(JNIEnv*, jclass, jint target, jint tex) {
+ #ifdef MACAPK_HAS_ANGLE
+-    glBindTexture(target, tex);
++    external_texture::BindTexture(target, tex);
+ #endif
+ }
+ void GLES20_glTexParameteri(JNIEnv*, jclass, jint target, jint pname, jint param) {
+ #ifdef MACAPK_HAS_ANGLE
+-    glTexParameteri(target, pname, param);
++    glTexParameteri(external_texture::Target(target), pname, param);
+ #endif
+ }
+ void GLES20_glBindBuffer(JNIEnv*, jclass, jint target, jint buf) {
+@@ -1216,7 +1218,9 @@
+ // ---- shader / program ----
+ jint GLES20_glCreateShader(JNIEnv*, jclass, jint type) {
+ #ifdef MACAPK_HAS_ANGLE
+-    return (jint) glCreateShader(type);
++    GLuint shader = glCreateShader(type);
++    external_texture::ForgetShader(shader);
++    return (jint) shader;
+ #else
+     return 0;
+ #endif
+@@ -1225,12 +1229,12 @@
+ #ifdef MACAPK_HAS_ANGLE
+     if (!src) return;
+     const char* s = env->GetStringUTFChars(src, nullptr);
+-    GLint len = (GLint) std::strlen(s);
+-    glShaderSource(shader, 1, &s, &len);
++    if (!s) return;
++    external_texture::SetShaderSource(shader, s);
+     env->ReleaseStringUTFChars(src, s);
+ #endif
+ }
+-void GLES20_glCompileShader(JNIEnv*, jclass, jint shader) {
++void GLES20_glCompileShader(JNIEnv* env, jclass, jint shader) {
+ #ifdef MACAPK_HAS_ANGLE
+     glCompileShader(shader);
+     GLint ok = 0;
+@@ -1241,6 +1245,16 @@
+         std::string buf(len > 0 ? len : 1, '\0');
+         if (len > 0) glGetShaderInfoLog(shader, len, nullptr, buf.data());
+         std::fprintf(stderr, "[E] gles: shader %d compile FAILED: %s\n", (int) shader, buf.c_str());
++        jclass status = env->FindClass("com/macapk/loader/InstagramMediaPreparationCompat");
++        if (status) {
++            jmethodID failed = env->GetStaticMethodID(status, "reportFailure", "(Ljava/lang/String;)V");
++            if (failed) {
++                jstring message = env->NewStringUTF("Video graphics could not start. Go back to media and try again.");
++                if (message) { env->CallStaticVoidMethod(status, failed, message); env->DeleteLocalRef(message); }
++            }
++            env->DeleteLocalRef(status);
++        }
++        if (env->ExceptionCheck()) env->ExceptionClear();
+     }
+ #endif
+ }
+@@ -1250,6 +1264,10 @@
+     if (!params) return;
+     GLint v = 0;
+     glGetShaderiv(shader, pname, &v);
++    if (pname == GL_SHADER_SOURCE_LENGTH) {
++        std::string original;
++        if (external_texture::OriginalSource(shader, original)) v = (GLint)original.size() + 1;
++    }
+     env->SetIntArrayRegion(params, offset, 1, reinterpret_cast<const jint*>(&v));
+ #endif
+ }
+@@ -1486,7 +1504,7 @@
+     jsize avail = env->GetArrayLength(params) - offset;
+     if (avail <= 0) return;
+     std::vector<GLint> v(GlScratchCount(pname, avail), 0);
+-    glGetIntegerv((GLenum) pname, v.data());
++    glGetIntegerv(external_texture::Binding((GLenum) pname), v.data());
+     jsize copy = GlCopyCount(pname, avail);
+     if ((size_t) copy > v.size()) copy = (jsize) v.size();
+     if (copy > 0) env->SetIntArrayRegion(params, offset, copy,
+@@ -2229,6 +2247,7 @@
+     GL_GATE("del");
+ #ifdef MACAPK_HAS_ANGLE
+     glDeleteShader((GLuint)sh);
++    external_texture::ForgetShader((GLuint)sh);
+ #endif
+ }
+ void GLES20_glDetachShader(JNIEnv*, jclass, jint p, jint sh) {
+@@ -2261,7 +2280,7 @@
+             std::fprintf(stderr, "[GLDRAW] glTexParameterf(target=0x%x pname=0x%x value=0x%x/%.1f)\n",
+                          t, pn, (unsigned)v, (double)v);
+     }
+-    glTexParameterf((GLenum)t,(GLenum)pn,v);
++    glTexParameterf(external_texture::Target((GLenum)t),(GLenum)pn,v);
+ #endif
+ }
+ void GLES20_glCopyTexImage2D(JNIEnv*, jclass, jint t, jint l, jint fmt, jint x, jint y, jint w, jint h, jint b) {
+@@ -2613,7 +2632,7 @@
+     jsize avail = env->GetArrayLength(params) - off;
+     if (avail <= 0) return;
+     std::vector<GLfloat> v(GlScratchCount(pname, avail), 0.0f);
+-    glGetFloatv((GLenum) pname, v.data());
++    glGetFloatv(external_texture::Binding((GLenum) pname), v.data());
+     jsize copy = GlCopyCount(pname, avail);
+     if ((size_t) copy > v.size()) copy = (jsize) v.size();
+     if (copy > 0) env->SetFloatArrayRegion(params, off, copy, v.data());
+@@ -2626,7 +2645,7 @@
+     jsize avail = env->GetArrayLength(params) - off;
+     if (avail <= 0) return;
+     std::vector<GLboolean> v(GlScratchCount(pname, avail), (GLboolean) 0);
+-    glGetBooleanv((GLenum) pname, v.data());
++    glGetBooleanv(external_texture::Binding((GLenum) pname), v.data());
+     jsize copy = GlCopyCount(pname, avail);
+     if ((size_t) copy > v.size()) copy = (jsize) v.size();
+     if (copy > 0) env->SetBooleanArrayRegion(params, off, copy,
+@@ -2641,7 +2660,8 @@
+     // / EXT_texture_border_clamp, which ANGLE exposes) makes the driver write 4.
+     // Same sizing the float sibling GLES20_glGetTexParameterfv already uses.
+     GLint v[4] = {0, 0, 0, 0};
+-    glGetTexParameteriv((GLenum) t, (GLenum) pn, v);
++    if ((GLenum)t == 0x8D65 && (GLenum)pn == 0x8D68) v[0] = 1;
++    else glGetTexParameteriv(external_texture::Target((GLenum) t), (GLenum) pn, v);
+     jsize avail = env->GetArrayLength(params) - off;
+     if (avail > 4) avail = 4;
+     if (avail > 0) env->SetIntArrayRegion(params, off, avail,
+@@ -2790,7 +2810,7 @@
+     if (avail <= 0) return;
+     jsize take = avail > 4 ? 4 : avail;
+     env->GetFloatArrayRegion(v, off, take, f);
+-    glTexParameterfv((GLenum) t, (GLenum) pn, f);
++    glTexParameterfv(external_texture::Target((GLenum) t), (GLenum) pn, f);
+ #else
+     (void) env; (void) t; (void) pn; (void) v; (void) off;
+ #endif
+@@ -2803,7 +2823,8 @@
+ #ifdef MACAPK_HAS_ANGLE
+     if (!params || off < 0) return;
+     GLfloat v[4] = {0, 0, 0, 0};
+-    glGetTexParameterfv((GLenum) t, (GLenum) pn, v);
++    if ((GLenum)t == 0x8D65 && (GLenum)pn == 0x8D68) v[0] = 1;
++    else glGetTexParameterfv(external_texture::Target((GLenum) t), (GLenum) pn, v);
+     jsize avail = env->GetArrayLength(params) - off;
+     if (avail > 4) avail = 4;
+     if (avail > 0) env->SetFloatArrayRegion(params, off, avail, v);
+@@ -2903,9 +2924,13 @@
+     jsize want = (bufsize < cap) ? bufsize : cap;
+     std::vector<char> buf((size_t) want, 0);
+     GLsizei n = 0;
+-    glGetShaderSource((GLuint) shader, (GLsizei) want, &n, buf.data());
++    std::string original;
++    if (external_texture::OriginalSource((GLuint)shader, original)) {
++        n = (GLsizei)std::min(original.size(), (size_t)want - 1);
++        std::memcpy(buf.data(), original.data(), n);
++    } else glGetShaderSource((GLuint) shader, (GLsizei) want, &n, buf.data());
+     if (n > want) n = (GLsizei) want;
+-    if (n > 0) env->SetByteArrayRegion(source, soff, n, reinterpret_cast<const jbyte*>(buf.data()));
++    if (n >= 0) env->SetByteArrayRegion(source, soff, n < want ? n + 1 : n, reinterpret_cast<const jbyte*>(buf.data()));
+     if (length && loff >= 0 && env->GetArrayLength(length) - loff >= 1) {
+         jint jn = (jint) n;
+         env->SetIntArrayRegion(length, loff, 1, &jn);
+--- /dev/null
++++ b/runtime/src/external_texture_bridge.h
+@@ -0,0 +1,109 @@
++#pragma once
++
++#include <EGL/egl.h>
++#include <GLES2/gl2.h>
++#include <cctype>
++#include <map>
++#include <mutex>
++#include <string>
++
++namespace macapk::external_texture {
++// SurfaceTexture uploads owned RGBA pixels into a 2D texture on ANGLE Metal.
++// Adapt the Android sampling interface to that representation, not to a fake image.
++inline GLenum Target(GLenum target) { return target == 0x8D65 ? GL_TEXTURE_2D : target; }
++inline GLenum Binding(GLenum name) { return name == 0x8D67 ? GL_TEXTURE_BINDING_2D : name; }
++
++inline std::string ShaderSource(const std::string& source) {
++    if (source.find("samplerExternalOES") == std::string::npos
++            && source.find("GL_OES_EGL_image_external") == std::string::npos) return source;
++    std::string result;
++    result.reserve(source.size());
++    bool block = false;
++    bool lineStart = true;
++    for (size_t i = 0; i < source.size();) {
++        if (block) {
++            if (source.compare(i, 2, "*/") == 0) { result += "*/"; i += 2; block = false; }
++            else { if (source[i] == '\n') lineStart = true; result += source[i++]; }
++            continue;
++        }
++        if (source.compare(i, 2, "/*") == 0) { result += "/*"; i += 2; block = true; continue; }
++        if (source.compare(i, 2, "//") == 0) {
++            size_t end = source.find('\n', i);
++            if (end == std::string::npos) end = source.size();
++            result.append(source, i, end - i); i = end; continue;
++        }
++        unsigned char ch = source[i];
++        if (lineStart && ch == '#') {
++            size_t end = source.find('\n', i);
++            if (end == std::string::npos) end = source.size();
++            size_t word = i + 1;
++            while (word < end && std::isspace((unsigned char)source[word])) ++word;
++            if (source.compare(word, 9, "extension") == 0
++                    && word + 9 < end && std::isspace((unsigned char)source[word + 9])) {
++                word += 9;
++                while (word < end && std::isspace((unsigned char)source[word])) ++word;
++                size_t stop = word;
++                while (stop < end && (std::isalnum((unsigned char)source[stop]) || source[stop] == '_')) ++stop;
++                std::string extension = source.substr(word, stop - word);
++                if (extension == "GL_OES_EGL_image_external" || extension == "GL_OES_EGL_image_external_essl3") {
++                    result.append(end - i, ' '); i = end; continue;
++                }
++            }
++        }
++        if (std::isalpha(ch) || ch == '_') {
++            size_t end = i + 1;
++            while (end < source.size() && (std::isalnum((unsigned char)source[end]) || source[end] == '_')) ++end;
++            std::string token = source.substr(i, end - i);
++            result += token == "samplerExternalOES" ? "sampler2D" : token;
++            i = end; lineStart = false; continue;
++        }
++        result += source[i++];
++        if (ch == '\n') lineStart = true;
++        else if (!std::isspace(ch)) lineStart = false;
++    }
++    return result;
++}
++
++using ShaderKey = std::pair<EGLContext, GLuint>;
++inline std::mutex sourceMutex;
++inline std::map<ShaderKey, std::string> originalSources;
++inline void ForgetContext(EGLContext context) {
++    std::lock_guard<std::mutex> lock(sourceMutex);
++    for (auto entry = originalSources.begin(); entry != originalSources.end();)
++        if (entry->first.first == context) entry = originalSources.erase(entry);
++        else ++entry;
++}
++inline void ForgetShader(GLuint shader) {
++    std::lock_guard<std::mutex> lock(sourceMutex);
++    originalSources.erase({eglGetCurrentContext(), shader});
++}
++inline bool OriginalSource(GLuint shader, std::string& source) {
++    std::lock_guard<std::mutex> lock(sourceMutex);
++    auto entry = originalSources.find({eglGetCurrentContext(), shader});
++    if (entry == originalSources.end()) return false;
++    source = entry->second;
++    return true;
++}
++inline void SetShaderSource(GLuint shader, const std::string& source) {
++    std::string adapted = ShaderSource(source);
++    {
++        std::lock_guard<std::mutex> lock(sourceMutex);
++        ShaderKey key{eglGetCurrentContext(), shader};
++        if (adapted == source) originalSources.erase(key);
++        else originalSources[key] = source;
++    }
++    const GLchar* text = adapted.data();
++    GLint size = static_cast<GLint>(adapted.size());
++    glShaderSource(shader, 1, &text, &size);
++}
++inline void BindTexture(GLenum target, GLuint texture) {
++    bool firstExternal = target == 0x8D65 && texture && !glIsTexture(texture);
++    glBindTexture(Target(target), texture);
++    if (firstExternal) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    }
++}
++}

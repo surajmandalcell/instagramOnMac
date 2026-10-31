@@ -1,0 +1,71 @@
+--- a/runtime/java/android/database/sqlite/SQLiteDatabase.java
++++ b/runtime/java/android/database/sqlite/SQLiteDatabase.java
+@@ -807,6 +807,26 @@
+      *  comment block above. */
+     synchronized void macapkAwaitTxConnection() {
+         macapkAwaitTxConnectionLocked();
++    }
++
++    /** AOSP SQLiteSession.executeSpecial: raw transaction SQL uses the same
++     * per-thread transaction stack as the Java API, including nested scopes. */
++    synchronized boolean macapkExecuteSpecial(String sql) {
++        throwIfNotOpen();
++        switch (DatabaseUtils.getSqlStatementType(sql)) {
++            case DatabaseUtils.STATEMENT_BEGIN:
++                beginTransaction();
++                return true;
++            case DatabaseUtils.STATEMENT_COMMIT:
++                setTransactionSuccessful();
++                endTransaction();
++                return true;
++            case DatabaseUtils.STATEMENT_ABORT:
++                endTransaction();
++                return true;
++            default:
++                return false;
++        }
+     }
+ 
+     public synchronized void beginTransaction() {
+--- a/runtime/java/android/database/sqlite/SQLiteStatement.java
++++ b/runtime/java/android/database/sqlite/SQLiteStatement.java
+@@ -63,6 +63,7 @@
+             if (db != null) {
+                 synchronized (db) {
+                     db.macapkAwaitTxConnection();
++                    if (db.macapkExecuteSpecial(getSql())) return;
+                     stepNonQuery();
+                     NativeSqlite.nativeReset(stmt);
+                 }
+@@ -78,6 +79,7 @@
+             if (stmt == 0 || db == null) return -1;
+             synchronized (db) {
+             db.macapkAwaitTxConnection();
++            if (db.macapkExecuteSpecial(getSql())) return 0;
+             stepNonQuery();
+             long handle = db.macapkDbHandle();
+             // AOSP executeForLastInsertedRowId: "err == SQLITE_DONE &&
+@@ -99,6 +101,7 @@
+             if (stmt == 0 || db == null) return 0;
+             synchronized (db) {
+             db.macapkAwaitTxConnection();
++            if (db.macapkExecuteSpecial(getSql())) return 0;
+             stepNonQuery();
+             int changes = NativeSqlite.nativeChanges(db.macapkDbHandle());
+             NativeSqlite.nativeReset(stmt);
+@@ -110,6 +113,7 @@
+         acquireReference();
+         try {
+             if (stmt == 0) return 0;
++            if (db != null && db.macapkExecuteSpecial(getSql())) return 0;
+             int rc = NativeSqlite.nativeStep(stmt);
+             if (rc != NativeSqlite.SQLITE_ROW) {
+                 // AOSP throws SQLiteDoneException when a query that is
+@@ -129,6 +133,7 @@
+         acquireReference();
+         try {
+             if (stmt == 0) return null;
++            if (db != null && db.macapkExecuteSpecial(getSql())) return null;
+             int rc = NativeSqlite.nativeStep(stmt);
+             if (rc != NativeSqlite.SQLITE_ROW) {
+                 // AOSP throws SQLiteDoneException for an empty result (see

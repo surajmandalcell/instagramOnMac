@@ -1,0 +1,107 @@
+--- a/runtime/java/com/macapk/loader/ClassFileRewriter.java
++++ b/runtime/java/com/macapk/loader/ClassFileRewriter.java
+@@ -178,11 +178,12 @@
+         boolean selectedGallery = matchesSelectedGallery(raw, className);
+         boolean selectedMetadata = matchesSelectedMetadata(raw, className);
+         boolean selectedPreview = matchesSelectedPreview(raw, className);
++        boolean surfacePreview = matchesSurfacePreview(raw, className);
+         boolean selectedImport = matchesSelectedImport(raw, className);
+         boolean selectedCanonical = containsNeedle(raw, "getCanonicalPath".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+             || containsNeedle(raw, "getCanonicalFile".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+         if (PRESCAN_ENABLED) {
+-            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || selectedPreview || selectedImport || selectedCanonical || needsFullParse(raw, className);
++            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || selectedPreview || surfacePreview || selectedImport || selectedCanonical || needsFullParse(raw, className);
+             if (PRESCAN_STATS) {
+                 long seen = prescanSeen.incrementAndGet();
+                 if (needsParse) prescanFullParsed.incrementAndGet();
+@@ -490,6 +491,11 @@
+                             && "(Ljava/lang/String;LX/rBz;)V".equals(cf.utf8(m.descIndex)))
+                         hits += redirectSelectedPreview(cf, m.code);
+                 }
++            }
++            if (surfacePreview) {
++                for (MethodEntry m : cf.methods)
++                    if (m.code != null && "A09".equals(cf.utf8(m.nameIndex))
++                            && "(LX/Owx;)V".equals(cf.utf8(m.descIndex))) hits += redirectSurfacePreview(cf, m.code);
+             }
+             if (selectedImport) {
+                 for (MethodEntry m : cf.methods) {
+@@ -1195,6 +1201,27 @@
+         } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
+     }
+ 
++    private static boolean matchesSurfacePreview(byte[] raw, String name) {
++        if (!"X.CcF".equals(name) && !"X/CcF".equals(name)) return false;
++        try { return "3bc226bad8fd200542d603bab2d79eace07b83fa2a4094cfc5887c6d6a199269".equals(
++                java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
++        } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
++    }
++
++    private static int redirectSurfacePreview(ClassFile cf, CodeAttr code) {
++        int start = code.codeOffset;
++        byte[] unused = {3, 0x3d, 0x0b, 0x46, 1, 0x3a, 4};
++        if (code.codeLen < unused.length) return 0;
++        for (int i = 0; i < unused.length; i++) if (code.code[start + i] != unused[i]) return 0;
++        int owner = cf.findOrAddClass("com/macapk/loader/InstagramSurfacePreviewCompat");
++        int type = cf.findOrAddNameAndType("onConsumerJoining", "(Ljava/lang/Object;Ljava/lang/Object;)V");
++        code.code[start] = 0x2a; code.code[start + 1] = 0x2b;
++        code.code[start + 2] = (byte) OP_INVOKESTATIC;
++        writeU2(code.code, start + 3, cf.findOrAddMethodref(owner, type));
++        code.code[start + 5] = 0; code.code[start + 6] = 0;
++        return 1;
++    }
++
+     private static boolean matchesSelectedPreview(byte[] raw, String name) {
+         if (!"X.S9Y".equals(name) && !"X/S9Y".equals(name)) return false;
+         try { return "0f9c88e6fda248bae689cbae935fdb88932e57d3c409d8eb955a6e76ab7fe433".equals(
+--- /dev/null
++++ b/runtime/java/com/macapk/loader/InstagramSurfacePreviewCompat.java
+@@ -0,0 +1,48 @@
++package com.macapk.loader;
++
++import android.os.Handler;
++import android.os.Looper;
++import android.view.Surface;
++import android.view.SurfaceView;
++import java.lang.reflect.InvocationTargetException;
++import java.util.Set;
++
++/** Replays the current surface to a newly joined renderer in the pinned gallery adapter. */
++public final class InstagramSurfacePreviewCompat {
++    private InstagramSurfacePreviewCompat() {}
++
++    private static Object field(Object owner, String name) throws ReflectiveOperationException {
++        return owner.getClass().getField(name).get(owner);
++    }
++
++    public static void onConsumerJoining(Object adapter, Object consumer) {
++        if (adapter == null || consumer == null || !"X.CcF".equals(adapter.getClass().getName())
++                || !"X.HC4".equals(consumer.getClass().getName())) return;
++        try {
++            Object broadcaster = field(adapter, "A0D");
++            if (!(field(broadcaster, "A00") instanceof Set<?> members) || members.contains(consumer)) return;
++            Handler.macapkCreateOwnerOnly(Looper.getMainLooper()).post(() -> deliver(adapter, consumer, members));
++        } catch (ReflectiveOperationException unsupportedShape) { }
++    }
++
++    private static void deliver(Object adapter, Object consumer, Set<?> members) {
++        try {
++            if (!members.contains(consumer) || !(field(adapter, "A0B") instanceof SurfaceView view)
++                    || !view.isAttachedToWindow() || !view.isShown() || view.getWidth() <= 0 || view.getHeight() <= 0) return;
++            int width = (Integer) field(adapter, "A03"), height = (Integer) field(adapter, "A02");
++            Object callback = field(adapter, "A07");
++            if (callback == null || !"X.LPu".equals(callback.getClass().getName()) || (Boolean) field(callback, "A00")) return;
++            java.lang.reflect.Field created = SurfaceView.class.getDeclaredField("holderSurfaceCreatedFired");
++            created.setAccessible(true);
++            if (!created.getBoolean(view)) return;
++            if (width <= 0 || height <= 0 || field(consumer, "A09") != null
++                    || field(consumer, "A08") != null || field(consumer, "A0A") != null) return;
++            Surface surface = view.getHolder().getSurface();
++            if (!surface.isValid()) return;
++            consumer.getClass().getMethod("G3D", Surface.class, int.class, int.class).invoke(consumer, surface, width, height);
++        } catch (ReflectiveOperationException failure) {
++            Throwable cause = failure instanceof InvocationTargetException invocation ? invocation.getCause() : failure;
++            NativeLog.e("SurfacePreview", "Late surface handoff failed: " + cause.getClass().getName());
++        }
++    }
++}

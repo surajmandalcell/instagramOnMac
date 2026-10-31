@@ -1,0 +1,20 @@
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -36,6 +36,7 @@
+ // straight to ANGLE's libGLESv2 symbols (we already link the dylib).
+ #include <GLES2/gl2.h>
+ #include <GLES2/gl2ext.h>
++#include <EGL/egl.h>
+ #include "angle_glue.h"   // AngleMarkFrameWithheld
+ #include "external_texture_bridge.h"
+ #endif
+@@ -2593,6 +2594,9 @@
+ // call looked identical to a successful one.
+ jint GLES20_glGetError(JNIEnv*, jclass) {
+ #ifdef MACAPK_HAS_ANGLE
++    // ANGLE's GL entry point reads existing TLS; the EGL query creates it
++    // on a fresh Java render thread without binding or changing a context.
++    (void) eglGetCurrentContext();
+     return (jint) glGetError();
+ #else
+     return 0;

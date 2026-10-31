@@ -1,0 +1,91 @@
+--- a/runtime/java/android/provider/MediaStoreProvider.java
++++ b/runtime/java/android/provider/MediaStoreProvider.java
+@@ -471,6 +471,28 @@
+ 
+     private boolean selectedOnlyCaller() {
+         return getContext() != null && "com.instagram.android".equals(getContext().getPackageName());
++    }
++
++    /** Selected DATA is an opaque read-only descriptor, so use its recorded
++     * display name when an app derives an extension from that DATA value. */
++    public static String macapkFileExtensionForSelectedData(String data) {
++        String displayName = null;
++        android.content.ContentProvider registered = android.content.ContentProviderRegistry.get(MediaStore.AUTHORITY);
++        if (registered instanceof MediaStoreProvider
++                && com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(data)) {
++            MediaStoreProvider provider = (MediaStoreProvider) registered;
++            String owner = provider.getContext() == null ? null : provider.getContext().getPackageName();
++            if (provider.mDb != null && owner != null) {
++                try (Cursor row = provider.mDb.query(TABLE, new String[]{COL_DISPLAY_NAME},
++                        COL_DATA + "=? AND " + COL_ID + " IN (SELECT media_id FROM " + SELECTED_TABLE
++                        + " WHERE ready=1 AND owner=?)", new String[]{data, owner}, null, null, null)) {
++                    if (row != null && row.moveToFirst()) displayName = row.getString(0);
++                }
++            }
++        }
++        if (displayName == null) return MimeTypeMap.getFileExtensionFromUrl(data);
++        int dot = displayName.lastIndexOf('.');
++        return dot < 0 ? "" : displayName.substring(dot + 1);
+     }
+ 
+     private boolean photosEnabledForCaller() {
+--- a/runtime/java/com/macapk/loader/ClassFileRewriter.java
++++ b/runtime/java/com/macapk/loader/ClassFileRewriter.java
+@@ -174,8 +174,9 @@
+     public static Result maybeRewrite(byte[] raw, String className) {
+         boolean optionalOptics = matchesOptionalOptics(raw, className);
+         boolean accountSections = matchesAccountSections(raw, className);
++        boolean selectedMedium = matchesSelectedMedium(raw, className);
+         if (PRESCAN_ENABLED) {
+-            boolean needsParse = optionalOptics || accountSections || needsFullParse(raw, className);
++            boolean needsParse = optionalOptics || accountSections || selectedMedium || needsFullParse(raw, className);
+             if (PRESCAN_STATS) {
+                 long seen = prescanSeen.incrementAndGet();
+                 if (needsParse) prescanFullParsed.incrementAndGet();
+@@ -453,6 +454,13 @@
+                     if (m.code != null && (("A0l".equals(name) && "(LX/6iP;)LX/2d6;".equals(desc))
+                             || ("invoke".equals(name) && "(Ljava/lang/Object;)Ljava/lang/Object;".equals(desc))))
+                         hits += redirectAccountSections(cf, m.code);
++                }
++            }
++            if (selectedMedium) {
++                for (MethodEntry m : cf.methods) {
++                    if (m.code != null && "A03".equals(cf.utf8(m.nameIndex))
++                            && "()Ljava/lang/String;".equals(cf.utf8(m.descIndex)))
++                        hits += redirectSelectedDataExtension(cf, m.code);
+                 }
+             }
+             if (hits > 0) {
+@@ -1075,6 +1083,32 @@
+                     writeU2(bytes, pc + 1, cf.findOrAddMethodref(cls, nameType));
+                     hits++;
+                 }
++            }
++            pc += length;
++        }
++        return hits;
++    }
++
++    private static boolean matchesSelectedMedium(byte[] raw, String name) {
++        if (!"com.instagram.common.gallery.Medium".equals(name)
++                && !"com/instagram/common/gallery/Medium".equals(name)) return false;
++        try {
++            return "793d9e5e69e117d909ef3e13c1e8c4bf5bc684b33ee57405f0fd7dc094f8def3".equals(
++                java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
++        } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
++    }
++
++    private static int redirectSelectedDataExtension(ClassFile cf, CodeAttr code) {
++        int hits = 0;
++        for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
++            int op = code.code[pc] & 255, length = instructionLength(op, code.code, pc);
++            if (length <= 0) break;
++            if (op == OP_INVOKESTATIC && isMethodref(cf, u2(code.code, pc + 1),
++                    "android/webkit/MimeTypeMap", "getFileExtensionFromUrl", "(Ljava/lang/String;)Ljava/lang/String;")) {
++                int owner = cf.findOrAddClass("android/provider/MediaStoreProvider");
++                int type = cf.findOrAddNameAndType("macapkFileExtensionForSelectedData", "(Ljava/lang/String;)Ljava/lang/String;");
++                writeU2(code.code, pc + 1, cf.findOrAddMethodref(owner, type));
++                hits++;
+             }
+             pc += length;
+         }

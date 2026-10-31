@@ -1,0 +1,213 @@
+--- a/runtime/java/android/graphics/SurfaceTexture.java
++++ b/runtime/java/android/graphics/SurfaceTexture.java
+@@ -171,6 +171,37 @@
+     // own texture transform. Both null for a decoded-video frame, which keeps
+     // that path byte-for-byte what it was before the GL producer existed.
+     private java.util.function.Consumer<int[]> mVideoFrameRecycler;
++    private static final int MAX_POOLED_VIDEO_INTS = 32 * 1024 * 1024;
++    private static final class DecodedBufferSlot {
++        int[] pixels;
++        boolean inUse;
++    }
++    private final DecodedBufferSlot[] mDecodedBuffers = {new DecodedBufferSlot(), new DecodedBufferSlot()};
++    private int mDecodedBufferSize;
++    private int mDecodedBufferGeneration;
++
++    /** A producer lease. Pixels cannot be reused until the consumer returns this lease. */
++    public static final class DecodedFrameBuffer implements java.util.function.Consumer<int[]> {
++        public final int[] pixels;
++        private final SurfaceTexture owner;
++        private final DecodedBufferSlot slot;
++        private final int generation;
++        private boolean queued;
++        private boolean returned;
++        private DecodedFrameBuffer(SurfaceTexture owner, DecodedBufferSlot slot, int[] pixels, int generation) {
++            this.owner = owner; this.slot = slot; this.pixels = pixels; this.generation = generation;
++        }
++        @Override public void accept(int[] ignored) {
++            synchronized (owner.mLock) {
++                if (returned) return;
++                returned = true;
++                if (slot != null) slot.inUse = false;
++            }
++        }
++        public void cancel() {
++            synchronized (owner.mLock) { if (!queued) accept(pixels); }
++        }
++    }
+     private float[] mVideoFrameTransform;
+     // True when the pushed frame came from a PREMULTIPLIED producer buffer (a
+     // GL window surface: what the app's context wrote), so a GL consumer must
+@@ -373,8 +404,8 @@
+         if (cam != 0) {
+             latchCameraFrameToGl(cam, tex);
+         } else if (vArgb != null) {
+-            latchDecodedFrameToGl(vArgb, vW, vH, vStride, tex, vPremul);
+-            if (vRecycle != null) vRecycle.accept(vArgb);
++            try { latchDecodedFrameToGl(vArgb, vW, vH, vStride, tex, vPremul); }
++            finally { if (vRecycle != null) vRecycle.accept(vArgb); }
+         }
+         // A stream with no attached frame source has no pixels to bind; the
+         // metadata latch above is all there is (pre-camera behaviour).
+@@ -722,6 +753,8 @@
+             mVideoFrameArgb = null;
+             mVideoFrameRecycler = null;
+             mVideoFrameTransform = null;
++            ++mDecodedBufferGeneration;
++            for (DecodedBufferSlot slot : mDecodedBuffers) slot.pixels = null;
+             // abandon() disconnects the producer side too; a later swap from
+             // the EGL window finds the stream abandoned and drops its frame.
+             mProducer = null;
+@@ -945,6 +978,38 @@
+         return true;
+     }
+ 
++    /** Two buffers per target; a busy consumer drops a frame instead of growing the queue. */
++    public static DecodedFrameBuffer macapkAcquireDecodedFrameBuffer(int count) {
++        SurfaceTexture target = videoTarget();
++        if (target == null || count <= 0) return null;
++        synchronized (target.mLock) {
++            if (target.mAbandoned) return null;
++            if (target.mDecodedBufferSize != count) {
++                target.mDecodedBufferSize = count;
++                ++target.mDecodedBufferGeneration;
++            }
++            // Preserve the old unpooled behavior for valid frames above 128 MiB.
++            if (count > MAX_POOLED_VIDEO_INTS) {
++                for (DecodedBufferSlot slot : target.mDecodedBuffers) if (!slot.inUse) slot.pixels = null;
++                return new DecodedFrameBuffer(target, null, new int[count], target.mDecodedBufferGeneration);
++            }
++            for (DecodedBufferSlot slot : target.mDecodedBuffers) {
++                if (slot.inUse) continue;
++                if (slot.pixels == null || slot.pixels.length != count) slot.pixels = new int[count];
++                DecodedFrameBuffer lease = new DecodedFrameBuffer(target, slot, slot.pixels, target.mDecodedBufferGeneration);
++                slot.inUse = true;
++                return lease;
++            }
++            return null;
++        }
++    }
++
++    public static boolean macapkOfferDecodedFrameBuffer(DecodedFrameBuffer lease, int width, int height, int stride) {
++        if (lease == null) return false;
++        lease.owner.macapkQueueProducerFrame(lease.pixels, width, height, stride, null, lease, false, lease);
++        return true;
++    }
++
+     /** Mac.apk framework-internal PRODUCER entry point, decoded-video shape
+      *  (the sole caller is macapkOfferDecodedFrame above). Unlike
+      *  macapkQueueFrame (the metadata-only, pull-the-pixels-later shape the
+@@ -1025,10 +1090,26 @@
+                                          int strideInPixels, float[] transform,
+                                          java.util.function.Consumer<int[]> recycler,
+                                          boolean premultipliedSource) {
++        macapkQueueProducerFrame(argb, width, height, strideInPixels, transform, recycler, premultipliedSource, null);
++    }
++
++    private void macapkQueueProducerFrame(int[] argb, int width, int height,
++                                         int strideInPixels, float[] transform,
++                                         java.util.function.Consumer<int[]> recycler,
++                                         boolean premultipliedSource, DecodedFrameBuffer lease) {
+         Handler h;
+         int[] superseded = null;
+         java.util.function.Consumer<int[]> supersededRecycler = null;
+         synchronized (mLock) {
++            if (lease != null) {
++                if (lease.queued) return;
++                if (lease.returned || lease.generation != mDecodedBufferGeneration || videoTarget() != this
++                        || strideInPixels < width || (long)strideInPixels * height > argb.length) {
++                    lease.accept(argb);
++                    return;
++                }
++                lease.queued = true;
++            }
+             if (mAbandoned || argb == null || width <= 0 || height <= 0) {
+                 // Dropped, exactly as the buffer queue drops a late frame;
+                 // hand the buffer straight back.
+@@ -1165,15 +1246,21 @@
+             }
+         }
+         if (vArgb != null) {
+-            if (mLatchBitmap == null
+-                    || mLatchBitmap.getWidth() != vW || mLatchBitmap.getHeight() != vH) {
+-                mLatchBitmap = Bitmap.createBitmap(vW, vH, Bitmap.Config.ARGB_8888);
++            try {
++                Bitmap latched = mLatchBitmap;
++                if (latched == null || latched.getWidth() != vW || latched.getHeight() != vH)
++                    latched = Bitmap.createBitmap(vW, vH, Bitmap.Config.ARGB_8888);
++                latched.setPixels(vArgb, 0, vStride, 0, 0, vW, vH);
++                synchronized (mLock) {
++                    if (mAbandoned) return null;
++                    mLatchBitmap = latched;
++                    mLatchGeneration++;
++                }
++                return latched;
++            } finally {
++                // Includes failed copies and a release racing the consumer.
++                if (vRecycle != null) vRecycle.accept(vArgb);
+             }
+-            mLatchBitmap.setPixels(vArgb, 0, vStride, 0, 0, vW, vH);
+-            // The copy is done; the producer may refill this buffer now.
+-            if (vRecycle != null) vRecycle.accept(vArgb);
+-            mLatchGeneration++;
+-            return mLatchBitmap;
+         }
+ 
+         int w;
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -6891,23 +6891,50 @@
+             size_t h      = CVPixelBufferGetHeight(pb);
+             size_t stride = CVPixelBufferGetBytesPerRow(pb);
+             const uint8_t* base = (const uint8_t*)CVPixelBufferGetBaseAddress(pb);
+-            if (base && w > 0 && h > 0 && (stride % 4) == 0) {
++            if (base && w > 0 && h > 0 && (stride % 4) == 0 && stride / 4 >= w
++                    && stride / 4 <= INT_MAX && h <= (size_t)INT_MAX / (stride / 4)) {
+                 jsize nInts = (jsize)((stride / 4) * h);
+-                jintArray arr = env->NewIntArray(nInts);
++                jmethodID acquire = env->GetStaticMethodID(cls, "macapkAcquireDecodedFrameBuffer",
++                    "(I)Landroid/graphics/SurfaceTexture$DecodedFrameBuffer;");
++                if (!acquire) env->ExceptionClear();
++                jobject lease = acquire ? env->CallStaticObjectMethod(cls, acquire, nInts) : nullptr;
++                if (env->ExceptionCheck()) { env->ExceptionClear(); lease = nullptr; }
++                jintArray arr = nullptr;
++                if (lease) {
++                    jclass leaseClass = env->GetObjectClass(lease);
++                    jfieldID pixels = env->GetFieldID(leaseClass, "pixels", "[I");
++                    if (pixels) arr = (jintArray)env->GetObjectField(lease, pixels);
++                    env->DeleteLocalRef(leaseClass);
++                } else if (acquire) {
++                    offered = true; // Both buffers are in flight; keep the last frame without allocating.
++                } else {
++                    arr = env->NewIntArray(nInts); // An older framework keeps its existing path.
++                }
+                 if (arr) {
+                     env->SetIntArrayRegion(arr, 0, nInts, (const jint*)base);
+                     jmethodID offer = env->GetStaticMethodID(
+-                        cls, "macapkOfferDecodedFrame", "([IIII)Z");
++                        cls, lease ? "macapkOfferDecodedFrameBuffer" : "macapkOfferDecodedFrame",
++                        lease ? "(Landroid/graphics/SurfaceTexture$DecodedFrameBuffer;III)Z" : "([IIII)Z");
+                     if (!offer) {
+                         env->ExceptionClear();
+                     } else {
+                         jboolean consumed = env->CallStaticBooleanMethod(
+-                            cls, offer, arr, (jint)w, (jint)h, (jint)(stride / 4));
++                            cls, offer, lease ? lease : arr, (jint)w, (jint)h, (jint)(stride / 4));
+                         if (env->ExceptionCheck()) { env->ExceptionClear(); consumed = JNI_FALSE; }
+                         offered = (consumed == JNI_TRUE);
+                     }
+                     env->DeleteLocalRef(arr);
+                 }
++                if (lease) {
++                    // No-op once queued; otherwise return a lease after any JNI copy/lookup failure.
++                    if (env->ExceptionCheck()) env->ExceptionClear();
++                    jclass leaseClass = env->GetObjectClass(lease);
++                    jmethodID cancel = env->GetMethodID(leaseClass, "cancel", "()V");
++                    if (cancel) env->CallVoidMethod(lease, cancel);
++                    if (env->ExceptionCheck()) env->ExceptionClear();
++                    env->DeleteLocalRef(leaseClass);
++                    env->DeleteLocalRef(lease);
++                }
+             }
+             CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+         }

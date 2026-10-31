@@ -1,0 +1,13 @@
+--- a/runtime/java/com/macapk/loader/DocumentPickerHandler.java
++++ b/runtime/java/com/macapk/loader/DocumentPickerHandler.java
+@@ -91,6 +91,10 @@
+             sMediaBrowseActive = true;
+             long id = sSeq.getAndIncrement();
+             sMediaBrowses.put(id, selected);
++            if (TEST_PATHS != null && !TEST_PATHS.isEmpty()) {
++                ActivityHost.macapkPostOnOwner(() -> finish(id, TEST_PATHS.split(":")));
++                return;
++            }
+             boolean shown = false;
+             try { shown = nativePick(false, false, new String[] { "image/*", "video/*" }, null, id); }
+             catch (Throwable failure) { NativeLog.w(TAG, "gallery: native file browser unavailable: " + failure); }

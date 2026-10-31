@@ -1,0 +1,235 @@
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -42,6 +42,74 @@
+ #endif
+ 
+ namespace macapk {
++
++#ifdef MACAPK_HAS_ANGLE
++// MACAPK_EXTERNAL_TEXTURE_RUNTIME_BEGIN
++static void GuestExternalShaderSource(GLuint shader, GLsizei count,
++        const GLchar* const* strings, const GLint* lengths) {
++    if (count <= 0 || !strings) { glShaderSource(shader, count, strings, lengths); return; }
++    std::string source;
++    for (GLsizei index = 0; index < count; ++index) {
++        if (!strings[index]) { glShaderSource(shader, count, strings, lengths); return; }
++        if (lengths && lengths[index] >= 0) source.append(strings[index], static_cast<size_t>(lengths[index]));
++        else source.append(strings[index]);
++    }
++    external_texture::SetShaderSource(shader, source);
++}
++static void GuestExternalGetShaderSource(GLuint shader, GLsizei capacity, GLsizei* length, GLchar* output) {
++    std::string source;
++    if (capacity < 0 || !external_texture::OriginalSource(shader, source)) {
++        glGetShaderSource(shader, capacity, length, output); return;
++    }
++    GLsizei copied = capacity > 0 ? static_cast<GLsizei>(std::min(source.size(), static_cast<size_t>(capacity - 1))) : 0;
++    if (output && capacity > 0) { std::memcpy(output, source.data(), copied); output[copied] = 0; }
++    if (length) *length = copied;
++}
++static void GuestExternalGetShaderiv(GLuint shader, GLenum name, GLint* value) {
++    std::string source;
++    if (name == GL_SHADER_SOURCE_LENGTH && value && external_texture::OriginalSource(shader, source))
++        *value = static_cast<GLint>(source.size() + 1);
++    else glGetShaderiv(shader, name, value);
++}
++static void GuestExternalDeleteShader(GLuint shader) { external_texture::ForgetShader(shader); glDeleteShader(shader); }
++static void GuestExternalBindTexture(GLenum target, GLuint texture) { external_texture::BindTexture(target, texture); }
++static void GuestExternalTexParameteri(GLenum target, GLenum name, GLint value) { glTexParameteri(external_texture::Target(target), name, value); }
++static void GuestExternalTexParameterf(GLenum target, GLenum name, GLfloat value) { glTexParameterf(external_texture::Target(target), name, value); }
++static void GuestExternalTexParameteriv(GLenum target, GLenum name, const GLint* value) { glTexParameteriv(external_texture::Target(target), name, value); }
++static void GuestExternalTexParameterfv(GLenum target, GLenum name, const GLfloat* value) { glTexParameterfv(external_texture::Target(target), name, value); }
++static void GuestExternalGetTexParameteriv(GLenum target, GLenum name, GLint* value) { glGetTexParameteriv(external_texture::Target(target), name, value); }
++static void GuestExternalGetTexParameterfv(GLenum target, GLenum name, GLfloat* value) { glGetTexParameterfv(external_texture::Target(target), name, value); }
++static void GuestExternalGetIntegerv(GLenum name, GLint* value) { glGetIntegerv(external_texture::Binding(name), value); }
++static void GuestExternalGetFloatv(GLenum name, GLfloat* value) { glGetFloatv(external_texture::Binding(name), value); }
++static void GuestExternalGetBooleanv(GLenum name, GLboolean* value) { glGetBooleanv(external_texture::Binding(name), value); }
++static EGLBoolean GuestExternalDestroyContext(EGLDisplay display, EGLContext context) {
++    EGLBoolean result = eglDestroyContext(display, context);
++    if (result) external_texture::ForgetContext(context);
++    return result;
++}
++extern "C" void* MacapkExternalTextureProc(const char* name) {
++    if (!name) return nullptr;
++#define EXTERNAL_PROC(symbol, adapter) if (std::strcmp(name, #symbol) == 0) return reinterpret_cast<void*>(&adapter)
++    EXTERNAL_PROC(glShaderSource, GuestExternalShaderSource);
++    EXTERNAL_PROC(glGetShaderSource, GuestExternalGetShaderSource);
++    EXTERNAL_PROC(glGetShaderiv, GuestExternalGetShaderiv);
++    EXTERNAL_PROC(glDeleteShader, GuestExternalDeleteShader);
++    EXTERNAL_PROC(glBindTexture, GuestExternalBindTexture);
++    EXTERNAL_PROC(glTexParameteri, GuestExternalTexParameteri);
++    EXTERNAL_PROC(glTexParameterf, GuestExternalTexParameterf);
++    EXTERNAL_PROC(glTexParameteriv, GuestExternalTexParameteriv);
++    EXTERNAL_PROC(glTexParameterfv, GuestExternalTexParameterfv);
++    EXTERNAL_PROC(glGetTexParameteriv, GuestExternalGetTexParameteriv);
++    EXTERNAL_PROC(glGetTexParameterfv, GuestExternalGetTexParameterfv);
++    EXTERNAL_PROC(glGetIntegerv, GuestExternalGetIntegerv);
++    EXTERNAL_PROC(glGetFloatv, GuestExternalGetFloatv);
++    EXTERNAL_PROC(glGetBooleanv, GuestExternalGetBooleanv);
++    EXTERNAL_PROC(eglDestroyContext, GuestExternalDestroyContext);
++#undef EXTERNAL_PROC
++    return nullptr;
++}
++// MACAPK_EXTERNAL_TEXTURE_RUNTIME_END
++#endif
+ 
+ namespace { void ReportOwnedMediaShaderFailure(JNIEnv* env); }
+ 
+--- a/runtime/translator/src/bionic_shim.cpp
++++ b/runtime/translator/src/bionic_shim.cpp
+@@ -37849,6 +37849,49 @@
+ // read the compile/link status and dump the info log on FAILURE only (a healthy
+ // engine pays only a status read). Counts are reported periodically so "0 fails
+ // out of N" is meaningful. Generic, no per-package code; MACAPK_SHADER_TRACE=1.
++// MACAPK_EXTERNAL_TEXTURE_ARM64_BEGIN
++static void* macapk_external_texture_proc(const char* name) {
++    using Resolve = void* (*)(const char*);
++    static Resolve bridge = reinterpret_cast<Resolve>(dlsym(RTLD_DEFAULT, "MacapkExternalTextureProc"));
++    if (bridge) if (void* result = bridge(name)) return result;
++    return dlsym(RTLD_DEFAULT, name);
++}
++#define EXTERNAL_FORWARD(result, name, parameters, arguments) \
++extern "C" result __macapk_arm64_##name parameters { \
++    using Function = result (*) parameters; \
++    static Function function = reinterpret_cast<Function>(macapk_external_texture_proc(#name)); \
++    if (function) return function arguments; \
++    return (result)0; \
++}
++EXTERNAL_FORWARD(void, glShaderSource, (unsigned shader, int count, const char* const* strings, const int* lengths), (shader,count,strings,lengths))
++EXTERNAL_FORWARD(void, glGetShaderSource, (unsigned shader, int capacity, int* length, char* output), (shader,capacity,length,output))
++EXTERNAL_FORWARD(void, glGetShaderiv, (unsigned shader, unsigned name, int* value), (shader,name,value))
++EXTERNAL_FORWARD(void, glDeleteShader, (unsigned shader), (shader))
++EXTERNAL_FORWARD(void, glBindTexture, (unsigned target, unsigned texture), (target,texture))
++EXTERNAL_FORWARD(void, glTexParameteri, (unsigned target, unsigned name, int value), (target,name,value))
++EXTERNAL_FORWARD(void, glTexParameterf, (unsigned target, unsigned name, float value), (target,name,value))
++EXTERNAL_FORWARD(void, glTexParameteriv, (unsigned target, unsigned name, const int* value), (target,name,value))
++EXTERNAL_FORWARD(void, glTexParameterfv, (unsigned target, unsigned name, const float* value), (target,name,value))
++EXTERNAL_FORWARD(void, glGetTexParameteriv, (unsigned target, unsigned name, int* value), (target,name,value))
++EXTERNAL_FORWARD(void, glGetTexParameterfv, (unsigned target, unsigned name, float* value), (target,name,value))
++EXTERNAL_FORWARD(void, glGetIntegerv, (unsigned name, int* value), (name,value))
++EXTERNAL_FORWARD(void, glGetFloatv, (unsigned name, float* value), (name,value))
++EXTERNAL_FORWARD(void, glGetBooleanv, (unsigned name, unsigned char* value), (name,value))
++EXTERNAL_FORWARD(unsigned, eglDestroyContext, (void* display, void* context), (display,context))
++#undef EXTERNAL_FORWARD
++static void* macapk_external_texture_guest_symbol(const char* name) {
++    if (!name) return nullptr;
++#define EXTERNAL_SYMBOL(symbol) if (std::strcmp(name,#symbol)==0) return reinterpret_cast<void*>(&__macapk_arm64_##symbol)
++    EXTERNAL_SYMBOL(glShaderSource); EXTERNAL_SYMBOL(glGetShaderSource); EXTERNAL_SYMBOL(glGetShaderiv);
++    EXTERNAL_SYMBOL(glDeleteShader); EXTERNAL_SYMBOL(glBindTexture);
++    EXTERNAL_SYMBOL(glTexParameteri); EXTERNAL_SYMBOL(glTexParameterf); EXTERNAL_SYMBOL(glTexParameteriv); EXTERNAL_SYMBOL(glTexParameterfv);
++    EXTERNAL_SYMBOL(glGetTexParameteriv); EXTERNAL_SYMBOL(glGetTexParameterfv);
++    EXTERNAL_SYMBOL(glGetIntegerv); EXTERNAL_SYMBOL(glGetFloatv); EXTERNAL_SYMBOL(glGetBooleanv);
++    EXTERNAL_SYMBOL(eglDestroyContext);
++#undef EXTERNAL_SYMBOL
++    return nullptr;
++}
++// MACAPK_EXTERNAL_TEXTURE_ARM64_END
+ static std::atomic<int> g_shader_compiles{0}, g_shader_compile_fail{0};
+ static std::atomic<int> g_program_links{0}, g_program_link_fail{0};
+ extern "C" void __macapk_arm64_glCompileShader(unsigned shader) {
+@@ -38515,6 +38558,7 @@
+ extern "C" unsigned __macapk_arm64_eglInitialize(void* dpy, int32_t* major, int32_t* minor);
+ extern "C" unsigned __macapk_arm64_eglTerminate(void* dpy);
+ extern "C" void* __macapk_arm64_eglGetProcAddress(const char* name) {
++    if (void* adapted = macapk_external_texture_guest_symbol(name)) return adapted;
+     using GpaFn = void* (*)(const char*);
+     static GpaFn real =
+         reinterpret_cast<GpaFn>(dlsym(RTLD_DEFAULT, "eglGetProcAddress"));
+@@ -38908,6 +38952,7 @@
+ 
+ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
+     if (!name) return nullptr;
++    if (void* adapted = macapk_external_texture_guest_symbol(name)) return adapted;
+     // Bionic's dlsym SENTINELS are not Darwin's, and forwarding them raw is a live
+     // bug rather than a cosmetic one. Bionic LP64 (bionic/libc/include/dlfcn.h):
+     //     RTLD_DEFAULT = (void*)0        RTLD_NEXT = (void*)-1
+@@ -53525,7 +53570,7 @@
+     glDeleteProgram(program); return 0;
+ }
+ uint32_t __macapk_shim_glDeleteShader(uint32_t shader, uint32_t, uint32_t, uint32_t) {
+-    glDeleteShader(shader); return 0;
++    __macapk_arm64_glDeleteShader(shader); return 0;
+ }
+ uint32_t __macapk_shim_glDepthFunc(uint32_t func, uint32_t, uint32_t, uint32_t) {
+     glDepthFunc(func); return 0;
+@@ -53612,7 +53657,7 @@
+             "[gles-diag] glBindTexture #%d target=0x%x tex=%u\n",
+             n, target, tex);
+     }
+-    glBindTexture(target, tex); return 0;
++    __macapk_arm64_glBindTexture(target, tex); return 0;
+ }
+ uint32_t __macapk_shim_glBlendFunc(uint32_t s, uint32_t d, uint32_t, uint32_t) {
+     glBlendFunc(s, d); return 0;
+@@ -53681,12 +53726,12 @@
+ }
+ uint32_t __macapk_shim_glGetFloatv(uint32_t pname, uint32_t params, uint32_t, uint32_t) {
+     if (!params) return 0;
+-    glGetFloatv(pname, static_cast<GLfloat*>(gptr_mut(params)));
++    __macapk_arm64_glGetFloatv(pname, static_cast<GLfloat*>(gptr_mut(params)));
+     return 0;
+ }
+ uint32_t __macapk_shim_glGetIntegerv(uint32_t pname, uint32_t params, uint32_t, uint32_t) {
+     if (!params) return 0;
+-    glGetIntegerv(pname, static_cast<GLint*>(gptr_mut(params)));
++    __macapk_arm64_glGetIntegerv(pname, static_cast<GLint*>(gptr_mut(params)));
+     return 0;
+ }
+ uint32_t __macapk_shim_glGetUniformLocation(uint32_t program, uint32_t name,
+@@ -53725,12 +53770,12 @@
+ uint32_t __macapk_shim_glGetShaderiv(uint32_t shader, uint32_t pname,
+                                        uint32_t params, uint32_t) {
+     if (!params) return 0;
+-    glGetShaderiv(shader, pname, static_cast<GLint*>(gptr_mut(params)));
++    __macapk_arm64_glGetShaderiv(shader, pname, static_cast<GLint*>(gptr_mut(params)));
+     return 0;
+ }
+ uint32_t __macapk_shim_glTexParameteri(uint32_t target, uint32_t pname,
+                                          uint32_t param, uint32_t) {
+-    glTexParameteri(target, pname, static_cast<GLint>(param)); return 0;
++    __macapk_arm64_glTexParameteri(target, pname, static_cast<GLint>(param)); return 0;
+ }
+ uint32_t __macapk_shim_glUniform2f(uint32_t loc, uint32_t a_bits, uint32_t b_bits,
+                                      uint32_t) {
+@@ -54175,7 +54220,7 @@
+     for (uint32_t i = 0; i < count; ++i) {
+         hosts.push_back(static_cast<const GLchar*>(gptr_const(g_strings[i])));
+     }
+-    glShaderSource(shader, static_cast<GLsizei>(count), hosts.data(), g_lengths);
++    __macapk_arm64_glShaderSource(shader, static_cast<GLsizei>(count), hosts.data(), g_lengths);
+     return 0;
+ }
+ // glGetProgramInfoLog / glGetShaderInfoLog: 4 args (id, bufSize,
+@@ -54359,7 +54404,7 @@
+ uint32_t __macapk_shim_glGetBooleanv(uint32_t pname, uint32_t data,
+                                        uint32_t, uint32_t) {
+     if (!data) return 0;
+-    glGetBooleanv(pname, static_cast<GLboolean*>(gptr_mut(data)));
++    __macapk_arm64_glGetBooleanv(pname, static_cast<GLboolean*>(gptr_mut(data)));
+     return 0;
+ }
+ 
+@@ -54420,7 +54465,7 @@
+ uint32_t __macapk_shim_glGetShaderSource(uint32_t shader, uint32_t bufSize,
+                                            uint32_t length, uint32_t source) {
+     if (!source) return 0;
+-    glGetShaderSource(shader, static_cast<GLsizei>(bufSize),
++    __macapk_arm64_glGetShaderSource(shader, static_cast<GLsizei>(bufSize),
+                       length ? static_cast<GLsizei*>(gptr_mut(length)) : nullptr,
+                       static_cast<GLchar*>(gptr_mut(source)));
+     return 0;
+@@ -64697,12 +64742,10 @@
+ }
+ extern "C" uint32_t __macapk_shim_eglDestroyContext(
+         uint32_t dpy_h, uint32_t ctx_h, uint32_t, uint32_t) {
+-    using Fn = unsigned (*)(void*, void*);
+-    static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "eglDestroyContext"));
+     void* dpy = __macapk_jni_resolve_handle(dpy_h);
+     void* ctx = __macapk_jni_resolve_handle(ctx_h);
+-    if (!dpy || !ctx || !real) return 0;
+-    unsigned r = real(dpy, ctx);
++    if (!dpy || !ctx) return 0;
++    unsigned r = __macapk_arm64_eglDestroyContext(dpy, ctx);
+     if (r) __macapk_jni_release_handle(ctx_h);
+     return r;
+ }

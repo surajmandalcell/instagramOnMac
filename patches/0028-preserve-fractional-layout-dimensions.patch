@@ -1,0 +1,46 @@
+--- a/runtime/java/android/content/res/TypedArray.java
++++ b/runtime/java/android/content/res/TypedArray.java
+@@ -1583,7 +1583,9 @@
+                 return android.util.TypedValue.complexToDimensionPixelSize(rec.data, macapkMetrics());
+             }
+         }
+-        return px != null ? (int) (float) px : def;
++        if (px == null) return def;
++        int rounded = (int) (px >= 0 ? px + 0.5f : px - 0.5f);
++        return rounded != 0 || px == 0f ? rounded : px > 0 ? 1 : -1;
+     }
+ 
+     /** MACAPK_TA_ATTR_DIMEN (default ON). A style item that is a THEME
+@@ -1701,7 +1703,7 @@
+             return v == null ? null : v.toString();
+         } catch (Throwable t) { return null; }
+     }
+-    public int getDimensionPixelOffset(int index, int def){ return getDimensionPixelSize(index, def); }
++    public int getDimensionPixelOffset(int index, int def) { return (int) getDimension(index, def); }
+     public float getDimension(int index, float def)       {
+         String v = macapkRawValueAt(index);
+         if (v == null) return def;
+--- a/runtime/java/android/view/LayoutInflater.java
++++ b/runtime/java/android/view/LayoutInflater.java
+@@ -2051,7 +2051,10 @@
+             return ViewGroup.LayoutParams.WRAP_CONTENT;  // -2
+         }
+         Float dim = parseDimensionPx(s);
+-        if (dim != null) return (int) (float) dim;
++        if (dim != null) {
++            int rounded = (int) (dim >= 0 ? dim + 0.5f : dim - 0.5f);
++            return rounded != 0 || dim == 0f ? rounded : dim > 0 ? 1 : -1;
++        }
+         try { return Integer.parseInt(s); } catch (NumberFormatException ignored) {}
+         return ViewGroup.LayoutParams.WRAP_CONTENT;
+     }
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -47,6 +47,7 @@
+ // MACAPK_EXTERNAL_TEXTURE_RUNTIME_BEGIN
+ static void GuestExternalShaderSource(GLuint shader, GLsizei count,
+         const GLchar* const* strings, const GLint* lengths) {
++    if (count == 0) external_texture::ForgetShader(shader);
+     if (count <= 0 || !strings) { glShaderSource(shader, count, strings, lengths); return; }
+     std::string source;
+     for (GLsizei index = 0; index < count; ++index) {

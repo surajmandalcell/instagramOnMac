@@ -1,0 +1,213 @@
+--- a/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
++++ b/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
+@@ -25,12 +25,11 @@
+ import java.util.Map;
+ import java.util.WeakHashMap;
+ 
+-/** Visible, bounded status for the Instagram 445 selected-media editor. */
++/** Truthful preparation errors and optional frame observations for Instagram 445. */
+ public final class InstagramMediaPreparationCompat {
+     private static final String PACKAGE = "com.instagram.android";
+     private static final String VERSION = "445.0.0.45.83";
+     private static final String ROUTE = "clips_camera";
+-    private static final long TIMEOUT_MS = 15_000L;
+     private static final int IDLE = 0, WAITING = 1, FAILED = 2, READY = 3;
+     private static final int PANEL = 0xEB202124;
+     private static final int TEXT = Color.WHITE;
+@@ -45,12 +44,9 @@
+     private static Activity editorActivity;
+     private static volatile ViewGroup editorRoot;
+     private static LinearLayout statusPanel;
+-    private static View previewScrim;
+     private static volatile boolean wantsFrameHint;
+     private static volatile boolean decodedFrameAvailable;
+-    private static Runnable timeout;
+     private static int state = IDLE;
+-    private static long generation;
+     private static boolean rendererFailed;
+     private static final GalleryStatus GALLERY = new GalleryStatus();
+ 
+@@ -110,7 +106,6 @@
+                 wantsFrameHint = false;
+                 if (state == FAILED) return;
+                 state = FAILED;
+-                cancelTimeout();
+                 showPanel();
+             } finally {
+                 synchronized (FAILURE_POSTED) { FAILURE_POSTED.remove(origin); }
+@@ -145,7 +140,6 @@
+         if (state == READY || rendererFailed) return;
+         state = READY;
+         wantsFrameHint = false;
+-        cancelTimeout();
+         removePanel();
+     }
+ 
+@@ -181,7 +175,7 @@
+                 && activity.getWindow().getDecorView() == origin ? activity : null;
+     }
+ 
+-    /** Releases the timeout and panel when the editor's window is detached. */
++    /** Releases status when the editor's window is detached. */
+     public static void onRootDetached(View view) {
+         runOnMain(() -> {
+             if (editorRoot == view) clearState();
+@@ -215,7 +209,8 @@
+         if (state == IDLE) {
+             state = WAITING;
+             wantsFrameHint = true;
+-            scheduleTimeout();
++            // The native editor can render without any Java frame callback.
++            // Missing observations do not prove that its preparation failed.
+         }
+         showPanel();
+         return true;
+@@ -223,7 +218,6 @@
+ 
+     private static void selectActivity(Activity activity) {
+         if (editorActivity == activity) return;
+-        cancelTimeout();
+         removePanel();
+         editorActivity = activity;
+         editorRoot = null;
+@@ -231,12 +225,10 @@
+         rendererFailed = false;
+         wantsFrameHint = false;
+         decodedFrameAvailable = false;
+-        generation++;
+     }
+ 
+     private static void clearState() {
+         if (editorActivity == null && editorRoot == null && state == IDLE) return;
+-        cancelTimeout();
+         removePanel();
+         editorActivity = null;
+         editorRoot = null;
+@@ -244,28 +236,10 @@
+         rendererFailed = false;
+         wantsFrameHint = false;
+         decodedFrameAvailable = false;
+-        generation++;
+     }
+ 
+-    private static void scheduleTimeout() {
+-        cancelTimeout();
+-        long expected = ++generation;
+-        timeout = () -> {
+-            if (generation != expected || state != WAITING) return;
+-            state = FAILED;
+-            timeout = null;
+-            showPanel();
+-        };
+-        mainHandler().postDelayed(timeout, TIMEOUT_MS);
+-    }
+-
+-    private static void cancelTimeout() {
+-        if (timeout != null) mainHandler().removeCallbacks(timeout);
+-        timeout = null;
+-    }
+-
+     private static void showPanel() {
+-        if (editorRoot == null || state == READY || state == IDLE) return;
++        if (editorRoot == null || state != FAILED || !rendererFailed) return;
+         FrameLayout host = overlayHost(editorRoot);
+         if (host == null) return;
+         if (statusPanel != null && statusPanel.getParent() == host
+@@ -273,15 +247,8 @@
+         removePanel();
+ 
+         Context context = editorRoot.getContext();
+-        View scrim = new View(context);
+-        scrim.setBackgroundColor(0xff121212);
+-        scrim.setClickable(true);
+-        scrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+-        host.addView(scrim, new FrameLayout.LayoutParams(
+-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+-        previewScrim = scrim;
+         LinearLayout panel = new LinearLayout(context);
+-        panel.setOrientation(state == WAITING ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
++        panel.setOrientation(LinearLayout.VERTICAL);
+         panel.setGravity(Gravity.CENTER_VERTICAL);
+         int inset = dp(context, 16);
+         panel.setPadding(inset, inset, inset, inset);
+@@ -293,52 +260,29 @@
+         panel.setTag(state);
+ 
+         TextView message = new TextView(context);
+-        message.setText(state == WAITING ? "Preparing preview…" : "Preview could not be prepared.");
++        message.setText("Preview could not be prepared. Use Back to return.");
+         message.setTextColor(TEXT);
+         message.setTextSize(16f);
+         message.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+-        message.setContentDescription(state == WAITING
+-                ? "Preparing video preview" : "Video preview could not be prepared");
+-
+-        if (state == WAITING) {
+-            ProgressBar progress = new ProgressBar(context);
+-            progress.setIndeterminate(true);
+-            progress.setContentDescription("Preparing preview");
+-            LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
+-                    dp(context, 22), dp(context, 22));
+-            progressParams.rightMargin = dp(context, 12);
+-            panel.addView(progress, progressParams);
+-            panel.addView(message, new LinearLayout.LayoutParams(
+-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+-            Button back = new Button(context);
+-            back.setText("Back");
+-            back.setAllCaps(false);
+-            back.setTextColor(TEXT);
+-            back.setContentDescription("Return from the video preview");
+-            back.setOnClickListener(ignored -> returnFromPreview());
+-            panel.addView(back, new LinearLayout.LayoutParams(
+-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+-        } else {
+-            message.setText("Preview could not be prepared. Use Back to return.");
+-            panel.addView(message, new LinearLayout.LayoutParams(
+-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+-            Button back = new Button(context);
+-            back.setText("Back");
+-            back.setAllCaps(false);
+-            back.setTextColor(TEXT);
+-            back.setContentDescription("Return from the video preview");
+-            back.setOnClickListener(ignored -> returnFromPreview());
+-            LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(
+-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+-            backParams.gravity = Gravity.END;
+-            backParams.topMargin = dp(context, 8);
+-            panel.addView(back, backParams);
+-        }
+-
++        message.setContentDescription("Video preview could not be prepared");
++        panel.addView(message, new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++        Button back = new Button(context);
++        back.setText("Back");
++        back.setAllCaps(false);
++        back.setTextColor(TEXT);
++        back.setContentDescription("Return from the video preview");
++        back.setOnClickListener(ignored -> returnFromPreview());
++        LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(
++                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++        backParams.gravity = Gravity.END;
++        backParams.topMargin = dp(context, 8);
++        panel.addView(back, backParams);
+         int maxWidth = Math.min(editorRoot.getWidth() - dp(context, 48), dp(context, 360));
+         if (maxWidth <= 0) maxWidth = ViewGroup.LayoutParams.WRAP_CONTENT;
+         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+-                maxWidth, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
++                maxWidth, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
++        params.bottomMargin = dp(context, 24);
+         try {
+             host.addView(panel, params);
+             statusPanel = panel;
+@@ -355,10 +299,6 @@
+     }
+ 
+     private static void removePanel() {
+-        if (previewScrim != null) {
+-            if (previewScrim.getParent() instanceof ViewGroup parent) parent.removeView(previewScrim);
+-            previewScrim = null;
+-        }
+         if (statusPanel == null) return;
+         ViewGroup parent = statusPanel.getParent() instanceof ViewGroup
+                 ? (ViewGroup) statusPanel.getParent() : null;

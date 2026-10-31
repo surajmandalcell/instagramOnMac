@@ -1,0 +1,286 @@
+--- a/runtime/src/media_decode.mm
++++ b/runtime/src/media_decode.mm
+@@ -40,6 +40,8 @@
+ #include <cmath>
+ #include <vector>
+ #include <deque>
++#include <string>
++#include "media_extractor.inc"
+ 
+ namespace {
+ 
+@@ -93,11 +95,28 @@
+ 
+ void* macapk_md_demux_open(const char* path) {
+     if (!path || !*path) return nullptr;
++    std::string inputPath = path;
++    int independent = -1;
++    if (inputPath.rfind("/dev/fd/", 0) == 0) {
++        char* end = nullptr;
++        long descriptor = strtol(path + 8, &end, 10);
++        struct stat original{}, fresh{};
++        char actual[PATH_MAX];
++        if (!end || *end || descriptor < 0 || fstat((int)descriptor, &original)
++                || !S_ISREG(original.st_mode) || fcntl((int)descriptor, F_GETPATH, actual)) return nullptr;
++        independent = open(actual, O_RDONLY | O_CLOEXEC);
++        if (independent < 0) return nullptr;
++        if (fstat(independent, &fresh) || original.st_dev != fresh.st_dev || original.st_ino != fresh.st_ino) {
++            close(independent); return nullptr;
++        }
++        inputPath = "/dev/fd/" + std::to_string(independent);
++    }
+     Demuxer* d = new Demuxer();
+     CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+-        nullptr, (const UInt8*)path, (CFIndex)strlen(path), false);
+-    if (!url) { delete d; return nullptr; }
++        nullptr, (const UInt8*)inputPath.c_str(), (CFIndex)inputPath.size(), false);
++    if (!url) { if (independent >= 0) close(independent); delete d; return nullptr; }
+     OSStatus s = AudioFileOpenURL(url, kAudioFileReadPermission, 0, &d->file);
++    if (independent >= 0) close(independent);
+     CFRelease(url);
+     if (s != noErr || !d->file) { delete d; return nullptr; }
+ 
+@@ -723,6 +742,17 @@
+ }  // extern "C"
+ 
+ static const JNINativeMethod kNativeMediaMethods[] = {
++    {(char*)"nativeExtractorOpen",(char*)"(Ljava/lang/String;)J",(void*)ex_open},
++    {(char*)"nativeExtractorTrackCount",(char*)"(J)I",(void*)ex_count},
++    {(char*)"nativeExtractorFormat",(char*)"(JI)Landroid/media/MediaFormat;",(void*)ex_format},
++    {(char*)"nativeExtractorSelect",(char*)"(JIZ)V",(void*)ex_select},
++    {(char*)"nativeExtractorCurrent",(char*)"(J)[B",(void*)ex_bytes},
++    {(char*)"nativeExtractorSampleTime",(char*)"(J)J",(void*)ex_time},
++    {(char*)"nativeExtractorSampleTrack",(char*)"(J)I",(void*)ex_index},
++    {(char*)"nativeExtractorSampleFlags",(char*)"(J)I",(void*)ex_flags},
++    {(char*)"nativeExtractorAdvance",(char*)"(J)Z",(void*)ex_advance},
++    {(char*)"nativeExtractorSeek",(char*)"(JJI)V",(void*)ex_seek},
++    {(char*)"nativeExtractorClose",(char*)"(J)V",(void*)ex_close},
+     {(char*)"nativeDemuxOpen",       (char*)"(Ljava/lang/String;)J", (void*)Java_com_macapk_loader_NativeMedia_nativeDemuxOpen},
+     {(char*)"nativeDemuxTrackCount", (char*)"(J)I",  (void*)Java_com_macapk_loader_NativeMedia_nativeDemuxTrackCount},
+     {(char*)"nativeDemuxSampleRate", (char*)"(J)I",  (void*)Java_com_macapk_loader_NativeMedia_nativeDemuxSampleRate},
+--- a/runtime/java/com/macapk/loader/NativeMedia.java
++++ b/runtime/java/com/macapk/loader/NativeMedia.java
+@@ -13,6 +13,17 @@
+ package com.macapk.loader;
+ 
+ public final class NativeMedia {
++    public static native long nativeExtractorOpen(String path);
++    public static native int nativeExtractorTrackCount(long handle);
++    public static native android.media.MediaFormat nativeExtractorFormat(long handle, int track);
++    public static native void nativeExtractorSelect(long handle, int track, boolean selected);
++    public static native byte[] nativeExtractorCurrent(long handle);
++    public static native long nativeExtractorSampleTime(long handle);
++    public static native int nativeExtractorSampleTrack(long handle);
++    public static native int nativeExtractorSampleFlags(long handle);
++    public static native boolean nativeExtractorAdvance(long handle);
++    public static native void nativeExtractorSeek(long handle, long timeUs, int mode);
++    public static native void nativeExtractorClose(long handle);
+     private NativeMedia() {}
+ 
+     // ---- Demuxer (backs MediaExtractor): AudioToolbox AudioFile ----
+--- a/runtime/src/media_extractor.inc
++++ b/runtime/src/media_extractor.inc
+@@ -0,0 +1,203 @@
++// AVFoundation compressed-track extraction. Existing AudioFile demux remains unchanged.
++#import <AVFoundation/AVFoundation.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <algorithm>
++
++namespace {
++struct ExtractTrack {
++    AVAssetTrack* track = nil;
++    AVAssetReader* reader = nil;
++    AVAssetReaderTrackOutput* output = nil;
++    CMSampleBufferRef sample = nullptr;
++    CMSampleBufferRef batch = nullptr;
++    CMItemCount batchIndex = 0;
++    bool syncIndexReady = false;
++    std::vector<int64_t> syncTimes;
++    CMFormatDescriptionRef format = nullptr;
++    std::string mime;
++    int nalLength = 0;
++    bool selected = false;
++    ~ExtractTrack() {
++        if (sample) CFRelease(sample);
++        if (batch) CFRelease(batch);
++        if (format) CFRelease(format);
++        [reader cancelReading]; [output release]; [reader release]; [track release];
++    }
++};
++struct Extractor {
++    AVURLAsset* asset = nil;
++    std::vector<ExtractTrack*> tracks;
++    int64_t seekUs = 0;
++    ~Extractor() { for (auto* t : tracks) delete t; [asset release]; }
++};
++static int64_t ex_pts(ExtractTrack* t) {
++    if (!t->sample) return -1;
++    CMTime pts = CMSampleBufferGetPresentationTimeStamp(t->sample);
++    return CMTIME_IS_NUMERIC(pts) ? (int64_t)llround(CMTimeGetSeconds(pts)*1000000) : -1;
++}
++static bool ex_sync(CMSampleBufferRef sample) {
++    if (!sample) return false;
++    CFArrayRef array = CMSampleBufferGetSampleAttachmentsArray(sample, false);
++    if (!array || !CFArrayGetCount(array)) return true;
++    CFTypeRef notSync = CFDictionaryGetValue(
++            (CFDictionaryRef)CFArrayGetValueAtIndex(array,0), kCMSampleAttachmentKey_NotSync);
++    return !notSync || (CFGetTypeID(notSync)==CFBooleanGetTypeID() && !CFBooleanGetValue((CFBooleanRef)notSync));
++}
++static bool ex_next(ExtractTrack* t) {
++    if (t->sample) { CFRelease(t->sample); t->sample = nullptr; }
++    do {
++        if (t->batch) {
++            if (t->batchIndex < CMSampleBufferGetNumSamples(t->batch)) {
++                OSStatus status = CMSampleBufferCopySampleBufferForRange(kCFAllocatorDefault,
++                        t->batch, CFRangeMake(t->batchIndex++,1), &t->sample);
++                return status==noErr && t->sample;
++            }
++            CFRelease(t->batch);t->batch=nullptr;
++        }
++        t->sample = [t->output copyNextSampleBuffer];
++        if (!t->sample) return false;
++        if (CMSampleBufferGetNumSamples(t->sample)>1) {
++            t->batch=t->sample;t->sample=nullptr;t->batchIndex=0;continue;
++        }
++        if (CMSampleBufferGetNumSamples(t->sample)>0) return true;
++        CFRelease(t->sample); t->sample = nullptr;
++    } while (true);
++}
++static bool ex_start(Extractor* e, ExtractTrack* t, int64_t us) {
++    if (t->sample) { CFRelease(t->sample); t->sample = nullptr; }
++    if (t->batch) { CFRelease(t->batch); t->batch = nullptr; }
++    [t->reader cancelReading]; [t->output release]; t->output = nil;
++    [t->reader release]; t->reader = nil;
++    NSError* error = nil;
++    t->reader = [[AVAssetReader alloc] initWithAsset:e->asset error:&error];
++    if (!t->reader) return false;
++    t->output = [[AVAssetReaderTrackOutput alloc] initWithTrack:t->track outputSettings:nil];
++    t->output.alwaysCopiesSampleData = NO;
++    if (![t->reader canAddOutput:t->output]) return false;
++    [t->reader addOutput:t->output];
++    if (us > 0) t->reader.timeRange = CMTimeRangeMake(CMTimeMake(us,1000000),kCMTimePositiveInfinity);
++    return [t->reader startReading] && ex_next(t);
++}
++static int ex_current(Extractor* e) {
++    int best = -1; int64_t pts = INT64_MAX;
++    for (size_t i=0;i<e->tracks.size();i++) {
++        auto* t=e->tracks[i]; int64_t p=ex_pts(t);
++        if (t->selected && t->sample && (best<0 || p<pts)) { best=(int)i;pts=p; }
++    }
++    return best;
++}
++static void ex_parameter(std::vector<uint8_t>& out,const uint8_t* bytes,size_t size) {
++    out.insert(out.end(),{0,0,0,1}); out.insert(out.end(),bytes,bytes+size);
++}
++static std::vector<uint8_t> ex_csd(ExtractTrack* t,int which) {
++    std::vector<uint8_t> bytes;
++    FourCharCode codec=CMFormatDescriptionGetMediaSubType(t->format);
++    if (codec==kCMVideoCodecType_H264) {
++        const uint8_t* p=nullptr; size_t size=0,count=0;int length=0;
++        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(t->format,which,&p,&size,&count,&length)==noErr)
++            ex_parameter(bytes,p,size);
++    } else if (codec==kCMVideoCodecType_HEVC && which==0) {
++        for(size_t i=0;i<3;i++) {const uint8_t* p=nullptr;size_t size=0,count=0;int length=0;
++            if(CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(t->format,i,&p,&size,&count,&length)==noErr) ex_parameter(bytes,p,size);}
++    } else if (t->mime=="audio/mp4a-latm" && which==0) {
++        size_t size=0; const void* cookie=CMAudioFormatDescriptionGetMagicCookie(t->format,&size);
++        if(cookie && size) bytes.assign((const uint8_t*)cookie,(const uint8_t*)cookie+size);
++    }
++    return bytes;
++}
++static jlong ex_open(JNIEnv* env,jclass,jstring path) {
++    if(!path)return 0;
++    const char* raw=env->GetStringUTFChars(path,nullptr);if(!raw)return 0;std::string resolved=raw;
++    env->ReleaseStringUTFChars(path,raw);
++    if(resolved.rfind("/dev/fd/",0)==0) {
++        char* end=nullptr;long fd=strtol(resolved.c_str()+8,&end,10);char actual[PATH_MAX];struct stat st{};
++        if(!end || *end || fd<0 || fstat((int)fd,&st) || !S_ISREG(st.st_mode) || fcntl((int)fd,F_GETPATH,actual))return 0;
++        resolved=actual;
++    }
++    @autoreleasepool {
++        auto* e=new Extractor();
++        // Descriptor slices have no useful suffix. Identify supported ISO media
++        // from its bytes instead of changing the file or inventing an extension.
++        uint8_t header[32]{};
++        int probe=open(resolved.c_str(),O_RDONLY|O_CLOEXEC);
++        ssize_t count=probe>=0?pread(probe,header,sizeof(header),0):-1;
++        if(probe>=0)close(probe);
++        NSDictionary* options=nil;
++        if(count>=12 && !memcmp(header+4,"ftyp",4)) {
++            NSString* mime=nil;
++            if(!memcmp(header+8,"qt  ",4))mime=@"video/quicktime";
++            else if(!memcmp(header+8,"isom",4)||!memcmp(header+8,"iso2",4)
++                    ||!memcmp(header+8,"mp41",4)||!memcmp(header+8,"mp42",4)
++                    ||!memcmp(header+8,"avc1",4)||!memcmp(header+8,"M4V ",4))mime=@"video/mp4";
++            if(mime)options=@{AVURLAssetOverrideMIMETypeKey:mime};
++        }
++        e->asset=[[AVURLAsset alloc] initWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:resolved.c_str()]] options:options];
++        bool video=false;
++        for(AVAssetTrack* track in [e->asset tracks]) {
++            NSArray* descriptions=[track formatDescriptions];if(!descriptions.count)continue;
++            CMFormatDescriptionRef fmt=(CMFormatDescriptionRef)[descriptions objectAtIndex:0];
++            FourCharCode code=CMFormatDescriptionGetMediaSubType(fmt);std::string mime;
++            if(code==kCMVideoCodecType_H264)mime="video/avc";
++            else if(code==kCMVideoCodecType_HEVC)mime="video/hevc";
++            else if(code==kAudioFormatMPEG4AAC)mime="audio/mp4a-latm";
++            else if(code==kAudioFormatMPEGLayer3)mime="audio/mpeg";
++            else continue;
++            auto* t=new ExtractTrack();t->track=[track retain];t->format=(CMFormatDescriptionRef)CFRetain(fmt);t->mime=mime;
++            if(mime.rfind("video/",0)==0) {const uint8_t* p;size_t n,c;int length=0;
++                OSStatus status=code==kCMVideoCodecType_H264
++                        ? CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt,0,&p,&n,&c,&length)
++                        : CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,0,&p,&n,&c,&length);
++                if(status!=noErr || length<1 || length>4){delete t;continue;}
++                video=true;t->nalLength=length;}
++            e->tracks.push_back(t);
++        }
++        if(!video) {delete e;return 0;}return(jlong)(uintptr_t)e;
++    }
++}
++static jint ex_count(JNIEnv*,jclass,jlong h){auto* e=(Extractor*)(uintptr_t)h;return e?(jint)e->tracks.size():0;}
++static jobject ex_format(JNIEnv* env,jclass,jlong h,jint index) {
++    auto* e=(Extractor*)(uintptr_t)h;if(!e || index<0 || (size_t)index>=e->tracks.size())return nullptr;
++    auto* t=e->tracks[index];jclass cls=env->FindClass("android/media/MediaFormat");
++    jobject format=env->NewObject(cls,env->GetMethodID(cls,"<init>","()V"));
++    auto integer=[&](const char* key,int value){jstring k=env->NewStringUTF(key);env->CallVoidMethod(format,env->GetMethodID(cls,"setInteger","(Ljava/lang/String;I)V"),k,value);env->DeleteLocalRef(k);};
++    jstring key=env->NewStringUTF("mime"),value=env->NewStringUTF(t->mime.c_str());
++    env->CallVoidMethod(format,env->GetMethodID(cls,"setString","(Ljava/lang/String;Ljava/lang/String;)V"),key,value);env->DeleteLocalRef(key);env->DeleteLocalRef(value);
++    if(t->nalLength) {auto d=CMVideoFormatDescriptionGetDimensions(t->format);integer("width",d.width);integer("height",d.height);integer("frame-rate",(int)llround(t->track.nominalFrameRate));
++        integer("rotation-degrees",(int)llround(atan2(t->track.preferredTransform.b,t->track.preferredTransform.a)*180/M_PI));}
++    else {auto* asbd=CMAudioFormatDescriptionGetStreamBasicDescription(t->format);if(asbd){integer("sample-rate",(int)asbd->mSampleRate);integer("channel-count",asbd->mChannelsPerFrame);}}
++    integer("max-input-size",16*1024*1024);
++    key=env->NewStringUTF("durationUs");env->CallVoidMethod(format,env->GetMethodID(cls,"setLong","(Ljava/lang/String;J)V"),key,(jlong)llround(CMTimeGetSeconds(t->track.timeRange.duration)*1000000));env->DeleteLocalRef(key);
++    for(int i=0;i<2;i++){auto csd=ex_csd(t,i);if(csd.empty())continue;jbyteArray data=env->NewByteArray((jsize)csd.size());env->SetByteArrayRegion(data,0,(jsize)csd.size(),(jbyte*)csd.data());
++        jclass buffer=env->FindClass("java/nio/ByteBuffer");jobject bb=env->CallStaticObjectMethod(buffer,env->GetStaticMethodID(buffer,"wrap","([B)Ljava/nio/ByteBuffer;"),data);
++        key=env->NewStringUTF(i?"csd-1":"csd-0");env->CallVoidMethod(format,env->GetMethodID(cls,"setByteBuffer","(Ljava/lang/String;Ljava/nio/ByteBuffer;)V"),key,bb);
++        env->DeleteLocalRef(key);env->DeleteLocalRef(bb);env->DeleteLocalRef(buffer);env->DeleteLocalRef(data);}
++    env->DeleteLocalRef(cls);return format;
++}
++static void ex_select(JNIEnv*,jclass,jlong h,jint index,jboolean selected) {auto* e=(Extractor*)(uintptr_t)h;if(!e||index<0||(size_t)index>=e->tracks.size())return;auto* t=e->tracks[index];if(t->selected==(bool)selected)return;t->selected=selected;if(selected)ex_start(e,t,e->seekUs);else{if(t->sample){CFRelease(t->sample);t->sample=nullptr;}[t->reader cancelReading];}}
++static jbyteArray ex_bytes(JNIEnv* env,jclass,jlong h) {
++    auto* e=(Extractor*)(uintptr_t)h;if(!e)return nullptr;int index=ex_current(e);if(index<0)return nullptr;auto* t=e->tracks[index];
++    CMBlockBufferRef block=CMSampleBufferGetDataBuffer(t->sample);if(!block)return nullptr;size_t n=CMBlockBufferGetDataLength(block);if(n>64*1024*1024)return nullptr;
++    std::vector<uint8_t> raw(n),out;if(CMBlockBufferCopyDataBytes(block,0,n,raw.data())!=noErr)return nullptr;
++    if(t->nalLength){size_t p=0;while(p<n){if(n-p<(size_t)t->nalLength)return nullptr;size_t length=0;for(int k=0;k<t->nalLength;k++)length=(length<<8)|raw[p++];if(length>n-p)return nullptr;ex_parameter(out,raw.data()+p,length);p+=length;}}
++    else out.swap(raw);
++    jbyteArray bytes=env->NewByteArray((jsize)out.size());if(bytes)env->SetByteArrayRegion(bytes,0,(jsize)out.size(),(jbyte*)out.data());return bytes;
++}
++static jlong ex_time(JNIEnv*,jclass,jlong h){auto* e=(Extractor*)(uintptr_t)h;int i=e?ex_current(e):-1;return i<0?-1:ex_pts(e->tracks[i]);}
++static jint ex_index(JNIEnv*,jclass,jlong h){auto* e=(Extractor*)(uintptr_t)h;return e?ex_current(e):-1;}
++static jint ex_flags(JNIEnv*,jclass,jlong h){auto* e=(Extractor*)(uintptr_t)h;int i=e?ex_current(e):-1;return i<0?0:(ex_sync(e->tracks[i]->sample)?1:0);}
++static jboolean ex_advance(JNIEnv*,jclass,jlong h){auto* e=(Extractor*)(uintptr_t)h;int i=e?ex_current(e):-1;if(i<0)return false;ex_next(e->tracks[i]);return ex_current(e)>=0;}
++static void ex_seek(JNIEnv*,jclass,jlong h,jlong us,jint mode){auto* e=(Extractor*)(uintptr_t)h;if(!e)return;us=std::max<jlong>(0,us);int64_t target=us;
++    for(auto* t:e->tracks)if(t->selected&&t->nalLength){
++        if(!t->syncIndexReady){ex_start(e,t,0);while(t->sample){if(ex_sync(t->sample))t->syncTimes.push_back(ex_pts(t));if(!ex_next(t))break;}
++            std::sort(t->syncTimes.begin(),t->syncTimes.end());t->syncTimes.erase(std::unique(t->syncTimes.begin(),t->syncTimes.end()),t->syncTimes.end());t->syncIndexReady=true;}
++        auto next=std::lower_bound(t->syncTimes.begin(),t->syncTimes.end(),us);
++        int64_t after=next==t->syncTimes.end()?-1:*next;
++        int64_t before=next==t->syncTimes.begin()?0:*(next-1);
++        if(after==us)before=after;
++        target=mode==1?(after>=0?after:before):mode==2&&after>=0&&after-us<us-before?after:before;break;}
++    e->seekUs=target;for(auto* t:e->tracks)if(t->selected)ex_start(e,t,target);
++}
++static void ex_close(JNIEnv*,jclass,jlong h){delete(Extractor*)(uintptr_t)h;}
++}

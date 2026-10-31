@@ -1,0 +1,162 @@
+{
+  "version": "1.0.2303",
+  "commit": "f5338a9dfa901fa78ef0be02d5eb44daaba037e9",
+  "source_url": "https://codeload.github.com/kksimp/Mac.apk/tar.gz/f5338a9dfa901fa78ef0be02d5eb44daaba037e9",
+  "source_sha256": "4a966f589e4cc1e3617a67affb701af84dd97e40ed328d7380317ff25f13ad8f",
+  "release_asset_url": "https://github.com/kksimp/Mac.apk/releases/download/v1.0.2303/macapk.dmg",
+  "release_asset_sha256": "af32b4d7e972f761629549818759cf1866d8f7c3a89b6e96b1bc8de585565d39",
+  "patches": [
+    {
+      "path": "patches/0001-instagram-macos-runtime.patch",
+      "sha256": "768468dc28f3a01627c525452db0499d8cb6cbf3e87d59c67b62abcac6fcbe48"
+    },
+    {
+      "path": "patches/0002-selected-media-and-editor.patch",
+      "sha256": "e9ba2f3b9eb45fa60e74166f8432e375ece2e13399e5d3d6393d70d45fba95d7"
+    },
+    {
+      "path": "patches/0003-scope-media-policy.patch",
+      "sha256": "343cf9a260554efebc1ac04365592492dc9df56063ae5d1cd1c78084308157dc"
+    },
+    {
+      "path": "patches/0004-editor-sqlite-transactions.patch",
+      "sha256": "7d93d491eb8b6bf3b1cb362d59ebc34111b24523a23312d72b04b5068ed20f6b"
+    },
+    {
+      "path": "patches/0005-reuse-video-frame-buffers.patch",
+      "sha256": "4df3a6f6765bef01a4856918516381a7cc51012a8edcffb4632e2077e2890bca"
+    },
+    {
+      "path": "patches/0006-camera-jpeg-delivery.patch",
+      "sha256": "cb2c1692b039da254fff12bb9e23902bb457a08f922637f0e5c749edff6f2b3b"
+    },
+    {
+      "path": "patches/0007-browse-only-gallery.patch",
+      "sha256": "be0dccd9e77dcce8a252f6ffbe16c55d249f1d3ec40f318df1cd23cfac2383bb"
+    },
+    {
+      "path": "patches/0008-selected-media-mime.patch",
+      "sha256": "fa419f5faf67103111e27941a47a295a89a9422e75c72d8cc63855f476d31756"
+    },
+    {
+      "path": "patches/0009-external-video-textures.patch",
+      "sha256": "ceb54e23683588ff86adf0f7923fd4712a9f45fea60da464e87ed8991bad08de"
+    },
+    {
+      "path": "patches/0010-editor-preparation-status.patch",
+      "sha256": "bf2b499b813cc8b1fc79855dfab380366d7c6bed99b72ab03a6c3d9d0d430c14"
+    },
+    {
+      "path": "patches/0011-compact-creation-mode-bar.patch",
+      "sha256": "0f3c42d444a0fa1250a83b8d78a1714bd0a95afca9fcc08e9deff8c948931aa4"
+    },
+    {
+      "path": "patches/0012-selected-gallery-models.patch",
+      "sha256": "0782acef72a23f46496e8082c464196a5b43ee4c8421da85527ad5b38ca5776c"
+    },
+    {
+      "path": "patches/0013-selected-content-uri-metadata.patch",
+      "sha256": "41a1753b6a9bc6a6a3984c352879ef2a49cda68a37ab102893c4ee31c796dd8c"
+    },
+    {
+      "path": "patches/0014-selected-media-readiness.patch",
+      "sha256": "e2f569fc2cdff97c02dba0d19534fdb8cd94e9c6714c803af9efb1e4a19fdbb0"
+    },
+    {
+      "path": "patches/0015-content-media-extractor.patch",
+      "sha256": "2b37adaadd87a13c55cdda3e9349a34b36197c1f1881cf4deaa229311e386000"
+    },
+    {
+      "path": "patches/0016-compressed-video-extractor.patch",
+      "sha256": "e0706c640f49358807fac33e607a5c7e6d9e6eb8817d07b614faf6d48b86631b"
+    },
+    {
+      "path": "patches/0017-cache-selected-mov-as-mp4.patch",
+      "sha256": "f3ece06234103dc5bbf88902100cc5116f80d3d1b843c4f9aeb7d88bcbcc2ddc"
+    },
+    {
+      "path": "patches/0018-gallery-video-preparation.patch",
+      "sha256": "7d3529a6995b1b250ff639b85d57807cc61fca663891c6776a31d061f73b8cf7"
+    },
+    {
+      "path": "patches/0019-visible-media-preparation-status.patch",
+      "sha256": "381eb23d3a38cb9fd9391c7541e8dcc4107812a5bda4afc0a8e6f21068f50697"
+    },
+    {
+      "path": "patches/0020-publish-vulkan-policy-before-guest-load.patch",
+      "sha256": "9e8699665ed36b1442988b254a5bd6a197e0201d2f9e08a4153a42800f27b18b"
+    },
+    {
+      "path": "patches/0021-preserve-selected-descriptor-canonical-paths.patch",
+      "sha256": "5ff9caff3cdc6f4a54accaa2411c426402303eaa2846ca73d86919ba3092e680"
+    },
+    {
+      "path": "patches/0022-report-reclaimable-available-memory.patch",
+      "sha256": "9ab6916cad75da87a44eb030f6fce7aa1db63f0e4723e4eb6cbe89c6d7bb5849"
+    },
+    {
+      "path": "patches/0023-use-prepared-mp4-in-import-model.patch",
+      "sha256": "9356cd5301c5431c8264228538c5641b99567fb542631c19b57a7d281975441b"
+    },
+    {
+      "path": "patches/0024-keep-native-editor-controls-available.patch",
+      "sha256": "252fe29a56872b1082fd675b6b932ab48360f6c84468e16da73c5b6e56716d2a"
+    },
+    {
+      "path": "patches/0025-encode-avc-from-egl-surfaces.patch",
+      "sha256": "de6906b30dee45c2edfd383d01a3019b6b9ef4952d075e9632e9f876224d2165"
+    },
+    {
+      "path": "patches/0026-initialize-angle-thread-before-error-query.patch",
+      "sha256": "a380db7273e4b194c929592b3f423a3813a9270ee613a798bc178473aa0d1ddc"
+    },
+    {
+      "path": "patches/0027-adapt-native-guest-external-textures.patch",
+      "sha256": "03e21f921fbfa331be3dcfbb4cb8c405ecdb67ef697d2231ead5a23c5fcdcef9"
+    },
+    {
+      "path": "patches/0028-preserve-fractional-layout-dimensions.patch",
+      "sha256": "91010bb27d4b6ca1408f3a56038f7cb8bddfb14639e2ce46d45af8d1dd0e5b80"
+    },
+    {
+      "path": "patches/0029-preserve-integer-offset-defaults.patch",
+      "sha256": "1b9f561a3b0b4acdcc646898d8bdcc048b8a6a328dc010d4536e00838197c523"
+    },
+    {
+      "path": "patches/0030-hide-hidden-native-surface-owners.patch",
+      "sha256": "7bc010dc05ec4b158f77d3024132078e573944a96f0feb12d5db3acfe51cd821"
+    },
+    {
+      "path": "patches/0031-defer-surface-callbacks-until-setup-finishes.patch",
+      "sha256": "4f03afbad61bc6a6a66aa99c04a5c23c0ed1cc59c6ec71ccf1507e5f085f7342"
+    },
+    {
+      "path": "patches/0032-bind-surfaces-to-surface-control-producers.patch",
+      "sha256": "3087dee80fc31cac8ed6f958651ac5eb70340b8aa36fbd300770bb5bd06a30a8"
+    },
+    {
+      "path": "patches/0033-hide-detached-control-with-owner-token.patch",
+      "sha256": "7acae9db89ca8f1ddcdb38941ca2a9da6b42dfc7ac1f14bd5fb3a9f454dae0b7"
+    },
+    {
+      "path": "patches/0034-drive-surface-lifetimes-from-view-visibility.patch",
+      "sha256": "8cfe44aa9afdaf267211e3c2a2143b38fbeaf36694eeec7fdda9575240100b30"
+    },
+    {
+      "path": "patches/0035-honor-existing-browse-test-paths.patch",
+      "sha256": "dba3457bc683e7c98717be91bc3b9a5038fb7c7c560fb93c0af8916d7084ddf6"
+    },
+    {
+      "path": "patches/0036-deliver-current-surface-to-late-preview-consumer.patch",
+      "sha256": "b072d86b4e254ac3ec1f74a85b3c878bd0a28c07c9ec08f1f3cda3bcd57fe1ee"
+    },
+    {
+      "path": "patches/0037-ensure-uninitialized-preview-consumer-on-registration.patch",
+      "sha256": "cb64f1263a34bf59c43643bdcafee67aa7d93d03d1f32d4b289599a3ac89e0d2"
+    },
+    {
+      "path": "patches/0038-schedule-view-animation-on-owner-frames.patch",
+      "sha256": "654c9d95cd19b6a9189b904603032adb5f4aa1fabf5556f0db92c3e8b2c7dffd"
+    }
+  ]
+}

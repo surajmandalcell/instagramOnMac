@@ -1,0 +1,126 @@
+--- a/runtime/java/android/app/ActivityManager.java
++++ b/runtime/java/android/app/ActivityManager.java
+@@ -42,7 +42,11 @@
+         } catch (Throwable ignored) { }
+         return 4096L * 1024 * 1024;   // fallback = the previous phone-class default
+     }
+-    private static long hostFreeBytes() {
++    private static long hostAvailableBytes() {
++        try {
++            long available = com.macapk.loader.NativeOs.availableMemoryBytes();
++            if (available >= 0) return available;
++        } catch (UnsatisfiedLinkError unavailable) { }
+         try {
+             com.sun.management.OperatingSystemMXBean os =
+                 (com.sun.management.OperatingSystemMXBean)
+@@ -127,7 +131,7 @@
+         // render black -- see bionic_shim.cpp __macapk_arm64_sysinfo). Back to the
+         // original phone-class values.
+         // WIRED to the real host (was hardcoded 4GB total / 1GB avail). totalMem +
+-        // availMem now reflect the actual machine via OperatingSystemMXBean, so an
++        // availMem include free and inactive RAM from Mach, so an
+         // app reading these to decide caching / onTrimMemory behavior sees the truth
+         // of the real device instead of a fixed 4GB phone.
+         outInfo.totalMem      = hostTotalBytes();
+@@ -135,7 +139,7 @@
+         // kernel can't see (e.g. a TEE). macOS has no such reservation, so
+         // advertised == total (and it tracks totalMem automatically).
+         outInfo.advertisedMem = outInfo.totalMem;
+-        outInfo.availMem      = Math.min(hostFreeBytes(), outInfo.totalMem);
++        outInfo.availMem      = Math.min(hostAvailableBytes(), outInfo.totalMem);
+         // AOSP's threshold is the low-memory-killer minfree (device-specific). On a
+         // device with no LMK, a small fraction of total (floored) is a faithful
+         // stand-in; lowMemory then derives from it instead of a fixed false.
+--- a/runtime/java/com/macapk/loader/NativeOs.java
++++ b/runtime/java/com/macapk/loader/NativeOs.java
+@@ -46,4 +46,6 @@
+     public static native int    unsetenv(String name);                  // 0, else -errno
+     /** Publish the resolved launch policy to the host before any guest library loads. */
+     public static native int publishGuestVulkanPolicy(boolean enabled); // 0, else -errno
++    /** System free plus inactive RAM in bytes, or -1 when Mach is unavailable. */
++    public static native long availableMemoryBytes();
+ }
+--- a/runtime/src/native_os.cpp
++++ b/runtime/src/native_os.cpp
+@@ -50,6 +50,8 @@
+ #include <sys/statvfs.h>
+ #include <compression.h>   // Apple's Compression framework: COMPRESSION_LZMA
+ #include <vector>
++#include <mach/mach.h>
++#include <limits>
+ 
+ namespace macapk {
+ namespace osnative {
+@@ -323,6 +325,29 @@
+ 
+ jint NativeOs_publishGuestVulkanPolicy(JNIEnv*, jclass, jboolean enabled) {
+     return ::setenv("MACAPK_GUEST_VULKAN", enabled ? "1" : "0", 1) == 0 ? 0 : -errno;
++}
++
++jlong available_memory_bytes(uint64_t free_pages, uint64_t inactive_pages, uint64_t page_size) {
++    if (page_size == 0) return -1;
++    const uint64_t limit = static_cast<uint64_t>(std::numeric_limits<jlong>::max());
++    if (free_pages > limit / page_size || inactive_pages > limit / page_size - free_pages)
++        return static_cast<jlong>(limit);
++    return static_cast<jlong>((free_pages + inactive_pages) * page_size);
++}
++
++jlong NativeOs_availableMemoryBytes(JNIEnv*, jclass) {
++    mach_port_t host = mach_host_self();
++    vm_size_t page_size = 0;
++    vm_statistics64_data_t stats{};
++    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++    kern_return_t page_result = host_page_size(host, &page_size);
++    kern_return_t stats_result = host_statistics64(host, HOST_VM_INFO64,
++            reinterpret_cast<host_info64_t>(&stats), &count);
++    mach_port_deallocate(mach_task_self(), host);
++    if (page_result != KERN_SUCCESS || stats_result != KERN_SUCCESS) return -1;
++    // Public free_count already includes speculative pages. Purgeable pages
++    // overlap other queues; adding either separately would count RAM twice.
++    return available_memory_bytes(stats.free_count, stats.inactive_count, page_size);
+ }
+ 
+ jint NativeOs_setenv(JNIEnv* env, jclass, jstring name, jstring value, jboolean overwrite) {
+@@ -486,6 +511,7 @@
+ }
+ 
+ const JNINativeMethod kNativeOsMethods[] = {
++    {(char*)"availableMemoryBytes", (char*)"()J", (void*)NativeOs_availableMemoryBytes},
+     {(char*)"publishGuestVulkanPolicy", (char*)"(Z)I", (void*)NativeOs_publishGuestVulkanPolicy},
+     {(char*)"mediaFileAvailable", (char*)"(Ljava/lang/String;)Z", (void*)NativeOs_mediaFileAvailable},
+     {(char*)"xzDecompress", (char*)"([B)[B",          (void*)NativeOs_xzDecompress},
+--- a/runtime/java/com/macapk/loader/Boot.java
++++ b/runtime/java/com/macapk/loader/Boot.java
+@@ -2823,11 +2823,9 @@
+      *  project's OpenJDK 21: getTotalMemorySize()/getFreeMemorySize()
+      *  return real host byte counts on Apple Silicon), falling back to
+      *  the SAME 8 GiB / quarter-free default bionic_shim.cpp's own synth
+-     *  uses if the MXBean cast/call fails. MemAvailable is reported equal
+-     *  to MemFree (not the slightly-higher free+inactive+purgeable figure
+-     *  bionic_shim.cpp computes via Mach host_statistics64 -- the MXBean
+-     *  has no equivalent breakdown) -- strictly conservative, never
+-     *  overstates available memory. A one-time boot-time snapshot, not
++     *  uses if the MXBean cast/call fails. MemAvailable includes Mach free
++     *  and inactive pages; MemFree remains the MXBean free-only value.
++     *  A one-time boot-time snapshot, not
+      *  live-updating: the /proc/self/statm-style "regenerate every open"
+      *  pattern bionic_shim.cpp uses has no equivalent hook on the Java
+      *  side (java.io.File cannot be shadowed -- see the call site's
+@@ -2862,10 +2860,16 @@
+         }
+         long totalKb = totalBytes >>> 10;
+         long freeKb  = freeBytes  >>> 10;
++        long availableBytes = freeBytes;
++        try {
++            long available = NativeOs.availableMemoryBytes();
++            if (available >= 0) availableBytes = available;
++        } catch (UnsatisfiedLinkError unavailable) { }
++        long availableKb = Math.min(availableBytes, totalBytes) >>> 10;
+         String content =
+             "MemTotal:       " + totalKb + " kB\n" +
+             "MemFree:        " + freeKb  + " kB\n" +
+-            "MemAvailable:   " + freeKb  + " kB\n" +
++            "MemAvailable:   " + availableKb  + " kB\n" +
+             "Buffers:        0 kB\n" +
+             "Cached:         0 kB\n" +
+             "SwapTotal:      0 kB\n" +

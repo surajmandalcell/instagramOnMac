@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img">
+  <title>Instagram on Mac</title>
+  <desc>An experimental source-only recipe for Apple Silicon. Fetch, patch, build, install. No APK or account data included.</desc>
+  <rect width="1280" height="640" fill="#f6f3eb"/>
+  <g fill="#22221e" font-family="monospace">
+    <text x="280" y="88" font-size="18" letter-spacing="3">SOURCE RECIPE / 001</text>
+    <line x1="280" y1="118" x2="1000" y2="118" stroke="#22221e" stroke-width="1" stroke-dasharray="7 7"/>
+    <text x="280" y="192" font-size="48" font-weight="700">INSTAGRAM</text>
+    <text x="280" y="250" font-size="48" font-weight="700">ON MAC.</text>
+    <text x="280" y="302" font-size="20">Android app. Apple Silicon. Mac.apk.</text>
+    <line x1="280" y1="336" x2="1000" y2="336" stroke="#22221e" stroke-width="1" stroke-dasharray="7 7"/>
+    <text x="280" y="384" font-size="20">DELIVERY</text>
+    <text x="1000" y="384" font-size="20" text-anchor="end">SOURCE ONLY</text>
+    <text x="280" y="424" font-size="20">STATUS</text>
+    <text x="1000" y="424" font-size="20" text-anchor="end">EXPERIMENTAL</text>
+    <text x="280" y="464" font-size="20">YOUR ACCOUNT DATA</text>
+    <text x="1000" y="464" font-size="20" text-anchor="end">STAYS LOCAL</text>
+    <line x1="280" y1="498" x2="1000" y2="498" stroke="#22221e" stroke-width="1" stroke-dasharray="7 7"/>
+    <text x="280" y="550" font-size="20">FETCH &gt; PATCH &gt; BUILD &gt; INSTALL</text>
+    <text x="280" y="588" font-size="16">Bring your own publisher-signed APK.</text>
+  </g>
+</svg>

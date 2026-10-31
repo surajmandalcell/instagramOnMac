@@ -1,0 +1,63 @@
+--- a/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
++++ b/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
+@@ -266,7 +266,9 @@
+ 
+     private static void showPanel() {
+         if (editorRoot == null || state == READY || state == IDLE) return;
+-        if (statusPanel != null && statusPanel.getParent() == editorRoot
++        FrameLayout host = overlayHost(editorRoot);
++        if (host == null) return;
++        if (statusPanel != null && statusPanel.getParent() == host
+                 && Integer.valueOf(state).equals(statusPanel.getTag())) return;
+         removePanel();
+ 
+@@ -275,7 +277,7 @@
+         scrim.setBackgroundColor(0xff121212);
+         scrim.setClickable(true);
+         scrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+-        editorRoot.addView(scrim, new FrameLayout.LayoutParams(
++        host.addView(scrim, new FrameLayout.LayoutParams(
+                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+         previewScrim = scrim;
+         LinearLayout panel = new LinearLayout(context);
+@@ -338,7 +340,7 @@
+         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                 maxWidth, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+         try {
+-            editorRoot.addView(panel, params);
++            host.addView(panel, params);
+             statusPanel = panel;
+             editorRoot.invalidate();
+         } catch (Throwable ignored) {
+@@ -346,6 +348,12 @@
+         }
+     }
+ 
++    private static FrameLayout overlayHost(ViewGroup decor) {
++        if (decor instanceof FrameLayout frame) return frame;
++        View content = decor.findViewById(android.R.id.content);
++        return content instanceof FrameLayout frame ? frame : null;
++    }
++
+     private static void removePanel() {
+         if (previewScrim != null) {
+             if (previewScrim.getParent() instanceof ViewGroup parent) parent.removeView(previewScrim);
+@@ -465,6 +473,9 @@
+         }
+ 
+         void show(Activity activity, String text, int percent, boolean failed) {
++            FrameLayout host = overlayHost(root);
++            if (host == null) { remove(); return; }
++            if (panel != null && panel.getParent() != host) remove();
+             if (panel == null) {
+                 panel = new LinearLayout(activity); panel.setOrientation(LinearLayout.VERTICAL);
+                 panel.setPadding(dp(activity, 16), dp(activity, 12), dp(activity, 16), dp(activity, 12));
+@@ -483,7 +494,7 @@
+                 int width = Math.min(root.getWidth() - dp(activity, 32), dp(activity, 340));
+                 FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(width > 0 ? width : -2, -2,
+                         Gravity.TOP | Gravity.CENTER_HORIZONTAL); params.topMargin = dp(activity, 72);
+-                root.addView(panel, params);
++                host.addView(panel, params);
+             }
+             message.setText(text); message.setContentDescription(text);
+             progress.setIndeterminate(percent <= 0); if (percent >= 0) { progress.setMax(100); progress.setProgress(percent); }

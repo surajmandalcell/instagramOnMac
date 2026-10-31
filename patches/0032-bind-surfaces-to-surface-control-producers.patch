@@ -1,0 +1,171 @@
+--- a/runtime/java/android/view/Surface.java
++++ b/runtime/java/android/view/Surface.java
+@@ -68,6 +68,7 @@
+     // association to place decoded video at the view's rect instead of over
+     // the whole window -- see SurfaceView.macapkActiveVideoRectPacked.
+     private SurfaceView mOwnerSurfaceView;
++    private SurfaceControl mSurfaceControl;
+ 
+     // lockCanvas()/unlockCanvasAndPost() state. AOSP keeps one persistent
+     // Canvas (mCanvas) reused across locks and a native mLockedObject handle
+@@ -86,6 +87,13 @@
+     private float mFrameRate;
+ 
+     public Surface() {}
++    public Surface(SurfaceControl control) {
++        if (control == null) throw new IllegalArgumentException("control must not be null");
++        Surface producer = control.macapkProducerSurface();
++        mSurfaceControl = control;
++        mSurfaceTexture = producer.mSurfaceTexture;
++        mOwnerSurfaceView = producer.mOwnerSurfaceView;
++    }
+     /** Encoder input is a producer sink, never the active decoded-video target. */
+     public static Surface macapkForEncoder(android.graphics.SurfaceTexture texture) {
+         Surface surface = new Surface();
+@@ -124,7 +132,7 @@
+         mOwnerSurfaceView = owner;
+     }
+     public SurfaceView macapkGetOwnerSurfaceView() {
+-        return mOwnerSurfaceView;
++        return mSurfaceControl == null ? mOwnerSurfaceView : mSurfaceControl.macapkOwnerSurfaceView();
+     }
+ 
+     /** Mac.apk framework-internal, called by the Bionic shim's
+@@ -134,7 +142,8 @@
+      *  fed by native code. The owner then composites below its window and punches
+      *  its hole (SurfaceView "native window owner"). */
+     public void macapkNoteNativeWindowConsumer() {
+-        SurfaceView.macapkNoteNativeWindowOwner(mOwnerSurfaceView);
++        if (mSurfaceControl != null) mSurfaceControl.macapkNoteNativeWindowConsumer();
++        else SurfaceView.macapkNoteNativeWindowOwner(macapkGetOwnerSurfaceView());
+     }
+ 
+     private void checkNotReleased() {
+@@ -386,6 +395,7 @@
+             Surface other = (Surface) o;
+             mSurfaceTexture = other.mSurfaceTexture;
+             mOwnerSurfaceView = other.mOwnerSurfaceView;
++            mSurfaceControl = other.mSurfaceControl;
+             mReleased = other.mReleased;
+         }
+     }
+--- a/runtime/java/android/view/SurfaceControl.java
++++ b/runtime/java/android/view/SurfaceControl.java
+@@ -23,6 +23,31 @@
+     private int mWidth;
+     private int mHeight;
+     private boolean mValid = true;
++    private Surface mProducerSurface;
++    private volatile SurfaceControl mParent;
++    private SurfaceView mOwner;
++    private volatile boolean mNativeWindowConsumed;
++
++    void macapkNoteNativeWindowConsumer() {
++        mNativeWindowConsumed = true;
++        SurfaceView.macapkNoteNativeWindowOwner(macapkOwnerSurfaceView());
++    }
++
++    synchronized void macapkBindProducer(Surface surface) { mProducerSurface = surface; }
++    synchronized SurfaceView macapkOwnerSurfaceView() {
++        if (mOwner != null) return mOwner;
++        if (mProducerSurface != null && mProducerSurface.macapkGetOwnerSurfaceView() != null)
++            return mProducerSurface.macapkGetOwnerSurfaceView();
++        return mParent == null ? null : mParent.macapkOwnerSurfaceView();
++    }
++    synchronized Surface macapkProducerSurface() {
++        if (!mValid) throw new IllegalArgumentException("SurfaceControl has been released");
++        if (mProducerSurface == null) {
++            mProducerSurface = new Surface();
++            mProducerSurface.macapkSetOwnerSurfaceView(mOwner);
++        }
++        return mProducerSurface;
++    }
+ 
+     SurfaceControl(String name, int width, int height) {
+         mName = name;
+@@ -165,6 +190,8 @@
+         private String mName = "SurfaceControl";
+         private int mWidth;
+         private int mHeight;
++        private SurfaceControl mParent;
++        private SurfaceView mOwner;
+ 
+         public Builder() {}
+         public Builder(Object session) {}  // SurfaceSession overload (untyped: no SurfaceSession in tree)
+@@ -178,7 +205,7 @@
+         public Builder setSecure(boolean secure) { return this; }
+         public Builder setOpaque(boolean opaque) { return this; }
+         public Builder setHidden(boolean hidden) { return this; }
+-        public Builder setParent(SurfaceControl parent) { return this; }
++        public Builder setParent(SurfaceControl parent) { mParent = parent; return this; }
+         public Builder setMetadata(int key, int data) { return this; }
+         public Builder setEffectLayer() { return this; }
+         public Builder setColorLayer() { return this; }
+@@ -186,10 +213,13 @@
+         public Builder setContainerLayer() { return this; }
+         public Builder setFlags(int flags) { return this; }
+         public Builder setCallsite(String callsite) { return this; }
+-        public Builder setLocalOwnerView(View view) { return this; }
++        public Builder setLocalOwnerView(View view) { mOwner = view instanceof SurfaceView ? (SurfaceView) view : null; return this; }
+ 
+         public SurfaceControl build() {
+-            return new SurfaceControl(mName, mWidth, mHeight);
++            SurfaceControl control = new SurfaceControl(mName, mWidth, mHeight);
++            control.mParent = mParent;
++            control.mOwner = mOwner;
++            return control;
+         }
+     }
+ 
+@@ -200,9 +230,10 @@
+     public static class Transaction implements Closeable, Parcelable {
+         public Transaction() {}
+ 
+-        public void apply() { macapkFireCommitted(); }
+-        public void apply(boolean sync) { macapkFireCommitted(); }
+-        public void applyAsyncUnsafe() {}
++        private final java.util.ArrayList<Runnable> mChanges = new java.util.ArrayList<>();
++        public void apply() { for (Runnable change : mChanges) change.run(); mChanges.clear(); macapkFireCommitted(); }
++        public void apply(boolean sync) { apply(); }
++        public void applyAsyncUnsafe() { apply(); }
+ 
+         public Transaction setVisibility(SurfaceControl sc, boolean visible) { return this; }
+         public Transaction show(SurfaceControl sc) { return this; }
+@@ -229,7 +260,17 @@
+         public Transaction setColor(SurfaceControl sc, float[] color) { return this; }
+         public Transaction setOpaque(SurfaceControl sc, boolean isOpaque) { return this; }
+         public Transaction setSecure(SurfaceControl sc, boolean isSecure) { return this; }
+-        public Transaction reparent(SurfaceControl sc, SurfaceControl newParent) { return this; }
++        public Transaction reparent(SurfaceControl sc, SurfaceControl newParent) {
++            if (sc == null) throw new IllegalArgumentException("control must not be null");
++            mChanges.add(() -> {
++                for (SurfaceControl parent = newParent; parent != null; parent = parent.mParent)
++                    if (parent == sc) throw new IllegalArgumentException("cyclic SurfaceControl parent");
++                sc.mParent = newParent;
++                if (sc.mNativeWindowConsumed)
++                    SurfaceView.macapkNoteNativeWindowOwner(sc.macapkOwnerSurfaceView());
++            });
++            return this;
++        }
+         public Transaction setBuffer(SurfaceControl sc, Object buffer) { return this; }
+         public Transaction merge(Transaction other) { return this; }
+ 
+@@ -333,7 +374,7 @@
+          *  deprecated at API 35. */
+         public Transaction clearTrustedPresentationCallback(SurfaceControl sc) { return this; }
+ 
+-        @Override public void close() {}
++        @Override public void close() { mChanges.clear(); }
+         @Override public int describeContents() { return 0; }
+         @Override public void writeToParcel(Parcel dest, int flags) {}
+ 
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -4087,6 +4087,7 @@
+             mSurfaceControl = new SurfaceControl.Builder()
+                     .setName("SurfaceView[" + getClass().getSimpleName() + "]")
+                     .build();
++            mSurfaceControl.macapkBindProducer(holder.getSurface());
+         }
+         return mSurfaceControl;
+     }

@@ -1,0 +1,586 @@
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -1848,6 +1848,7 @@
+      *  and ViewGroup.addView dispatches recursively when the parent
+      *  is already attached. */
+     boolean macapkAttached = false;
++    private long macapkInstagramEditorStatusCheckMs;
+     public boolean isAttachedToWindow()                { return macapkAttached; }
+     private static boolean warnedAttachThrow = false;
+     private static boolean warnedSizeChanged = false;
+@@ -2030,6 +2031,14 @@
+     public void macapkDispatchDetachedFromWindow() {
+         macapkTraceComposeAttach("DETACH", macapkAttached);
+         if (!macapkAttached) return;
++        if (getRootView() == this) {
++            Context detachContext = getContext();
++            if (detachContext != null && "com.instagram.android".equals(detachContext.getPackageName())) {
++                try {
++                    com.macapk.loader.InstagramMediaPreparationCompat.onRootDetached(this);
++                } catch (Throwable ignored) {}
++            }
++        }
+         macapkAttached = false;
+         try { onDetachedFromWindow(); } catch (Throwable ignored) {}
+         if (attachStateChangeListeners != null) {
+@@ -5473,6 +5482,18 @@
+     // are display polish that no test APK has needed yet.
+     public void draw(android.graphics.Canvas canvas) {
+         if (canvas == null) return;
++        if (!(parent instanceof View) && getRootView() == this) {
++            Context drawContext = getContext();
++            if (drawContext != null && "com.instagram.android".equals(drawContext.getPackageName())) {
++                long now = android.os.SystemClock.uptimeMillis();
++                if (now >= macapkInstagramEditorStatusCheckMs) {
++                    macapkInstagramEditorStatusCheckMs = now + 250L;
++                    try {
++                        com.macapk.loader.InstagramMediaPreparationCompat.onRootDraw(this);
++                    } catch (Throwable ignored) {}
++                }
++            }
++        }
+         // AOSP: when getClipToOutline() is true the view masks its
+         // background + content + children to the outline produced by
+         // its ViewOutlineProvider (rebuildOutline -> getOutline, then
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -42,6 +42,8 @@
+ 
+ namespace macapk {
+ 
++namespace { void ReportOwnedMediaShaderFailure(JNIEnv* env); }
++
+ // Window policy phase 2a, defined in cocoa_bridge.mm. It belongs in
+ // macapk/cocoa_bridge.h next to CocoaApplyWindowOrientation; it is declared here
+ // only because the lane that added it did not own that header (move it there
+@@ -1245,16 +1247,7 @@
+         std::string buf(len > 0 ? len : 1, '\0');
+         if (len > 0) glGetShaderInfoLog(shader, len, nullptr, buf.data());
+         std::fprintf(stderr, "[E] gles: shader %d compile FAILED: %s\n", (int) shader, buf.c_str());
+-        jclass status = env->FindClass("com/macapk/loader/InstagramMediaPreparationCompat");
+-        if (status) {
+-            jmethodID failed = env->GetStaticMethodID(status, "reportFailure", "(Ljava/lang/String;)V");
+-            if (failed) {
+-                jstring message = env->NewStringUTF("Video graphics could not start. Go back to media and try again.");
+-                if (message) { env->CallStaticVoidMethod(status, failed, message); env->DeleteLocalRef(message); }
+-            }
+-            env->DeleteLocalRef(status);
+-        }
+-        if (env->ExceptionCheck()) env->ExceptionClear();
++        ReportOwnedMediaShaderFailure(env);
+     }
+ #endif
+ }
+--- a/runtime/src/egl14_bridges.inc
++++ b/runtime/src/egl14_bridges.inc
+@@ -308,6 +308,8 @@
+ 
+ struct Egl14Win { void* dpy; void* app; void* cur; };
+ std::vector<Egl14Win> g_egl14Wins;   // guarded by Egl14WinLock
++struct Egl14SurfaceView { void* dpy; void* surface; jweak origin; bool frameReported; };
++std::vector<Egl14SurfaceView> g_egl14SurfaceViews;  // guarded by Egl14WinLock
+ bool g_egl14WinBusy = false;
+ // A spin lock on compiler builtins: this file is included inside a namespace
+ // (by native_methods.cpp and two gate harnesses), so it cannot include
+@@ -364,13 +366,51 @@
+     Egl14WinLock l;
+     for (Egl14Win& w : g_egl14Wins)
+         if (w.dpy == dpy && w.app == app) { w.cur = cur; return; }
++}
++void egl14_surface_view_add(JNIEnv* env, void* dpy, void* surface, jobject origin) {
++    if (!surface || !origin) return;
++    Egl14WinLock l;
++    for (size_t i = 0; i < g_egl14SurfaceViews.size();) {
++        const Egl14SurfaceView& entry = g_egl14SurfaceViews[i];
++        if (entry.dpy == dpy && entry.surface == surface) {
++            env->DeleteWeakGlobalRef(entry.origin);
++            g_egl14SurfaceViews.erase(g_egl14SurfaceViews.begin() + static_cast<long>(i));
++        } else
++            ++i;
++    }
++    jweak weak = env->NewWeakGlobalRef(origin);
++    if (weak) g_egl14SurfaceViews.push_back(Egl14SurfaceView{dpy, surface, weak, false});
++}
++void egl14_surface_view_remove(JNIEnv* env, void* dpy, void* surface) {
++    Egl14WinLock l;
++    for (size_t i = 0; i < g_egl14SurfaceViews.size();) {
++        if (g_egl14SurfaceViews[i].dpy == dpy && (!surface || g_egl14SurfaceViews[i].surface == surface)) {
++            env->DeleteWeakGlobalRef(g_egl14SurfaceViews[i].origin);
++            g_egl14SurfaceViews.erase(g_egl14SurfaceViews.begin() + static_cast<long>(i));
++            if (surface) return;
++        } else ++i;
++    }
+ }
++jobject egl14_surface_view_origin(JNIEnv* env, void* dpy, void* surface, bool firstFrame) {
++    Egl14WinLock l;
++    for (Egl14SurfaceView& entry : g_egl14SurfaceViews) {
++        if (entry.dpy == dpy && entry.surface == surface) {
++            if (firstFrame && entry.frameReported) return nullptr;
++            jobject origin = env->NewLocalRef(entry.origin);
++            if (origin && firstFrame) entry.frameReported = true;
++            return origin;
++        }
++    }
++    return nullptr;
++}
+ 
+ // The MacApkGlWindow upcalls, resolved once. `create` is published last, so a
+ // reader that sees it sees the rest.
+ struct Egl14Upcalls {
+     jclass cls = nullptr;
++    jclass mediaCompatCls = nullptr;
+     jmethodID swap = nullptr, destroy = nullptr, create = nullptr;
++    jmethodID reportFramePresented = nullptr, reportFailure = nullptr, captureOriginRoot = nullptr;
+     bool missing = false;
+ };
+ Egl14Upcalls g_egl14Up;
+@@ -398,12 +438,44 @@
+     }
+     g_egl14Up.cls = static_cast<jclass>(env->NewGlobalRef(c));
+     env->DeleteLocalRef(c);
++    jclass mediaCompat = env->FindClass("com/macapk/loader/InstagramMediaPreparationCompat");
++    if (mediaCompat) {
++        jmethodID reportFrame = env->GetStaticMethodID(mediaCompat, "reportFramePresented", "(Landroid/view/View;)V");
++        jmethodID reportFailure = reportFrame ? env->GetStaticMethodID(mediaCompat, "reportFailure", "(Landroid/view/View;Ljava/lang/String;)V") : nullptr;
++        jmethodID captureOrigin = reportFailure ? env->GetStaticMethodID(mediaCompat, "captureOriginRoot", "(Ljava/lang/Object;)Landroid/view/View;") : nullptr;
++        if (captureOrigin) {
++            g_egl14Up.mediaCompatCls = static_cast<jclass>(env->NewGlobalRef(mediaCompat));
++            g_egl14Up.reportFramePresented = reportFrame;
++            g_egl14Up.reportFailure = reportFailure;
++            g_egl14Up.captureOriginRoot = captureOrigin;
++        } else {
++            env->ExceptionClear();
++        }
++        env->DeleteLocalRef(mediaCompat);
++    } else {
++        env->ExceptionClear();
++    }
+     g_egl14Up.swap = sw;
+     g_egl14Up.destroy = de;
+     __atomic_store_n(&g_egl14Up.create, cr, __ATOMIC_RELEASE);
+     return true;
+ }
+ 
++void ReportOwnedMediaShaderFailure(JNIEnv* env) {
++    static auto currentDisplay = (MEGLDisplay(*)())gl3_resolve("eglGetCurrentDisplay");
++    static auto currentSurface = (MEGLSurface(*)(MEGLint))gl3_resolve("eglGetCurrentSurface");
++    if (!currentDisplay || !currentSurface || !g_egl14Up.mediaCompatCls || !g_egl14Up.reportFailure) return;
++    jobject origin = egl14_surface_view_origin(env, currentDisplay(), currentSurface(0x3059), false);
++    if (!origin) return;
++    jstring message = env->NewStringUTF("Video graphics could not start. Go back to media and try again.");
++    if (message) {
++        env->CallStaticVoidMethod(g_egl14Up.mediaCompatCls, g_egl14Up.reportFailure, origin, message);
++        env->DeleteLocalRef(message);
++    }
++    env->DeleteLocalRef(origin);
++    if (env->ExceptionCheck()) env->ExceptionClear();
++}
++
+ // Destroy one window taken out of the registry: the facade disconnects the
+ // stream and destroys the CURRENT pbuffer; the creation pbuffer, kept to hold
+ // the app's handle, goes too once a resize had replaced it. The facade's
+@@ -605,7 +677,9 @@
+         jboolean ignored;
+         if (!egl14_win_destroy(env, w, &ignored)) return JNI_FALSE;
+     }
+-    return (p && p(d)) ? JNI_TRUE : JNI_FALSE;
++    MEGLBoolean terminated = p ? p(d) : 0;
++    if (terminated) egl14_surface_view_remove(env, d, nullptr);
++    return terminated ? JNI_TRUE : JNI_FALSE;
+ }
+ jstring EGL14_eglQueryString(JNIEnv* env, jclass, jobject dpy, jint name) {
+     static auto p = (const char*(*)(MEGLDisplay, MEGLint))gl3_resolve("eglQueryString");
+@@ -724,6 +798,10 @@
+         void* s = p ? p(d, c, layer, al.get()) : nullptr;
+         al.release();   // before any JNI call (a pre-fix pin is a critical section)
+         if (s) {
++            jobject origin = g_egl14Up.captureOriginRoot
++                ? env->CallStaticObjectMethod(g_egl14Up.mediaCompatCls, g_egl14Up.captureOriginRoot, win) : nullptr;
++            if (env->ExceptionCheck()) env->ExceptionClear();
++            if (origin) { egl14_surface_view_add(env, d, s, origin); env->DeleteLocalRef(origin); }
+             if (noteLive) noteLive();
+             fprintf(stderr, "[egl14] eglCreateWindowSurface(SurfaceView) -> EGLSurface %p on "
+                     "native-EGL layer %p (%dx%d)\n", s, layer, lw, lh);
+@@ -765,7 +843,9 @@
+         jboolean r = JNI_FALSE;
+         return egl14_win_destroy(env, w, &r) ? r : JNI_FALSE;
+     }
+-    return (p && p(d, s)) ? JNI_TRUE : JNI_FALSE;
++    MEGLBoolean destroyed = p ? p(d, s) : 0;
++    if (destroyed) egl14_surface_view_remove(env, d, s);
++    return destroyed ? JNI_TRUE : JNI_FALSE;
+ }
+ jboolean EGL14_eglQuerySurface(JNIEnv* env, jclass, jobject dpy, jobject surf,
+                                jint attr, jintArray val, jint valOff) {
+@@ -844,7 +924,12 @@
+ }
+ jboolean EGL14_eglDestroyContext(JNIEnv* env, jclass, jobject dpy, jobject ctx) {
+     static auto p = (MEGLBoolean(*)(MEGLDisplay, MEGLContext))gl3_resolve("eglDestroyContext");
+-    return (p && p(egl_h(env, dpy), egl_h(env, ctx))) ? JNI_TRUE : JNI_FALSE;
++    void* context = egl_h(env, ctx);
++    MEGLBoolean destroyed = p ? p(egl_h(env, dpy), context) : 0;
++#ifdef MACAPK_HAS_ANGLE
++    if (destroyed) external_texture::ForgetContext(reinterpret_cast<EGLContext>(context));
++#endif
++    return destroyed ? JNI_TRUE : JNI_FALSE;
+ }
+ jboolean EGL14_eglMakeCurrent(JNIEnv* env, jclass, jobject dpy, jobject draw,
+                               jobject read, jobject ctx) {
+@@ -905,7 +990,14 @@
+         // but it is the call whose error the app reads.
+         if (!egl14_win_swap(env, w)) return JNI_FALSE;
+     }
+-    return (p && p(d, egl14_win_cur(d, s))) ? JNI_TRUE : JNI_FALSE;
++    MEGLBoolean swapped = p ? p(d, egl14_win_cur(d, s)) : 0;
++    jobject origin = swapped ? egl14_surface_view_origin(env, d, s, true) : nullptr;
++    if (origin && g_egl14Up.mediaCompatCls && g_egl14Up.reportFramePresented) {
++        env->CallStaticVoidMethod(g_egl14Up.mediaCompatCls, g_egl14Up.reportFramePresented, origin);
++        if (env->ExceptionCheck()) env->ExceptionClear();
++    }
++    if (origin) env->DeleteLocalRef(origin);
++    return swapped ? JNI_TRUE : JNI_FALSE;
+ }
+ jboolean EGL14_eglCopyBuffers(JNIEnv* env, jclass, jobject dpy, jobject surf, jint target) {
+     static auto p = (MEGLBoolean(*)(MEGLDisplay, MEGLSurface, void*))gl3_resolve("eglCopyBuffers");
+--- /dev/null
++++ b/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
+@@ -0,0 +1,339 @@
++package com.macapk.loader;
++
++import android.app.Activity;
++import android.content.Context;
++import android.content.pm.PackageInfo;
++import android.graphics.Color;
++import android.graphics.drawable.GradientDrawable;
++import android.os.Handler;
++import android.os.Looper;
++import android.view.Gravity;
++import android.view.View;
++import android.view.ViewGroup;
++import android.view.Surface;
++import android.view.SurfaceHolder;
++import android.view.SurfaceView;
++import android.widget.Button;
++import android.widget.FrameLayout;
++import android.widget.LinearLayout;
++import android.widget.ProgressBar;
++import android.widget.TextView;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.List;
++import java.util.Map;
++import java.util.WeakHashMap;
++
++/** Visible, bounded status for the Instagram 445 selected-media editor. */
++public final class InstagramMediaPreparationCompat {
++    private static final String PACKAGE = "com.instagram.android";
++    private static final String VERSION = "445.0.0.45.83";
++    private static final String ROUTE = "clips_camera";
++    private static final long TIMEOUT_MS = 15_000L;
++    private static final int IDLE = 0, WAITING = 1, FAILED = 2, READY = 3;
++    private static final int PANEL = 0xEB202124;
++    private static final int TEXT = Color.WHITE;
++    private static final Handler MAIN = new Handler(Looper.getMainLooper());
++    private static final Map<View, Boolean> FAILURE_POSTED = new WeakHashMap<>();
++
++    private static Activity editorActivity;
++    private static ViewGroup editorRoot;
++    private static LinearLayout statusPanel;
++    private static Runnable timeout;
++    private static int state = IDLE;
++    private static long generation;
++    private static boolean rendererFailed;
++
++    private InstagramMediaPreparationCompat() {}
++
++    /** Called once from the root View draw path; false means the editor is still starting. */
++    public static boolean onRootDraw(View view) {
++        if (view == null || view.getRootView() != view) return true;
++        if (Looper.myLooper() != Looper.getMainLooper()) {
++            MAIN.post(() -> onRootDrawMain(view));
++            return true;
++        }
++        return onRootDrawMain(view);
++    }
++
++    /** Called by the renderer after a known media preparation failure. */
++    public static void reportFailure(View origin, String ignoredReason) {
++        if (origin == null) return;
++        synchronized (FAILURE_POSTED) {
++            if (FAILURE_POSTED.put(origin, true) != null) return;
++        }
++        boolean posted = runOnMain(() -> {
++            try {
++                Activity activity = editorForOrigin(origin);
++                if (activity == null) return;
++                selectActivity(activity);
++                rendererFailed = true;
++                if (state == FAILED) return;
++                state = FAILED;
++                cancelTimeout();
++                showPanel();
++            } finally {
++                synchronized (FAILURE_POSTED) { FAILURE_POSTED.remove(origin); }
++            }
++        });
++        if (!posted) synchronized (FAILURE_POSTED) { FAILURE_POSTED.remove(origin); }
++    }
++
++    /** Called after the selected editor SurfaceView completes its first EGL14 swap. */
++    public static void reportFramePresented(View origin) {
++        runOnMain(() -> {
++            Activity activity = editorForOrigin(origin);
++            if (activity == null) return;
++            selectActivity(activity);
++            if (state == READY || rendererFailed) return;
++            state = READY;
++            cancelTimeout();
++            removePanel();
++        });
++    }
++
++    /** Native SurfaceView events retain only a weak reference to this decor root. */
++    public static View captureOriginRoot(Object window) {
++        try {
++            Surface surface = window instanceof SurfaceView view ? view.getHolder().getSurface()
++                    : window instanceof SurfaceHolder holder ? holder.getSurface()
++                    : window instanceof Surface value ? value : null;
++            SurfaceView owner = surface == null ? null : surface.macapkGetOwnerSurfaceView();
++            View root = owner == null ? null : owner.getRootView();
++            return root != null && root.getContext() != null
++                    && PACKAGE.equals(root.getContext().getPackageName()) ? root : null;
++        } catch (RuntimeException unavailable) { return null; }
++    }
++
++    private static Activity editorForOrigin(View origin) {
++        Activity activity = targetEditor(ActivityHost.macapkTopActivity());
++        return origin != null && activity != null && activity.getWindow() != null
++                && activity.getWindow().getDecorView() == origin ? activity : null;
++    }
++
++    /** Releases the timeout and panel when the editor's window is detached. */
++    public static void onRootDetached(View view) {
++        runOnMain(() -> {
++            if (editorRoot == view) clearState();
++        });
++    }
++
++    private static boolean onRootDrawMain(View view) {
++        Context context = view.getContext();
++        if (context == null || !PACKAGE.equals(context.getPackageName())) return true;
++        Activity top = ActivityHost.macapkTopActivity();
++        if (top == null) return false;
++        if (!isEditorRoute(top)) {
++            clearState();
++            return false;
++        }
++        Activity activity = targetEditor(top);
++        if (activity == null) {
++            return false;
++        }
++        if (activity.getWindow() == null || activity.getWindow().getDecorView() != view) return false;
++
++        selectActivity(activity);
++        if (!(view instanceof ViewGroup group)) return true;
++        if (editorRoot != group) {
++            removePanel();
++            editorRoot = group;
++        }
++        if (state == IDLE) {
++            state = WAITING;
++            scheduleTimeout();
++        }
++        showPanel();
++        return true;
++    }
++
++    private static void selectActivity(Activity activity) {
++        if (editorActivity == activity) return;
++        cancelTimeout();
++        removePanel();
++        editorActivity = activity;
++        editorRoot = null;
++        state = IDLE;
++        rendererFailed = false;
++        generation++;
++    }
++
++    private static void clearState() {
++        if (editorActivity == null && editorRoot == null && state == IDLE) return;
++        cancelTimeout();
++        removePanel();
++        editorActivity = null;
++        editorRoot = null;
++        state = IDLE;
++        rendererFailed = false;
++        generation++;
++    }
++
++    private static void scheduleTimeout() {
++        cancelTimeout();
++        long expected = ++generation;
++        timeout = () -> {
++            if (generation != expected || state != WAITING) return;
++            state = FAILED;
++            timeout = null;
++            showPanel();
++        };
++        MAIN.postDelayed(timeout, TIMEOUT_MS);
++    }
++
++    private static void cancelTimeout() {
++        if (timeout != null) MAIN.removeCallbacks(timeout);
++        timeout = null;
++    }
++
++    private static void showPanel() {
++        if (editorRoot == null || state == READY || state == IDLE) return;
++        if (statusPanel != null && statusPanel.getParent() == editorRoot
++                && Integer.valueOf(state).equals(statusPanel.getTag())) return;
++        removePanel();
++
++        Context context = editorRoot.getContext();
++        LinearLayout panel = new LinearLayout(context);
++        panel.setOrientation(state == WAITING ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
++        panel.setGravity(Gravity.CENTER_VERTICAL);
++        int inset = dp(context, 16);
++        panel.setPadding(inset, inset, inset, inset);
++        panel.setClickable(false);
++        panel.setFocusable(false);
++        panel.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
++        panel.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
++        panel.setBackground(background(context));
++        panel.setTag(state);
++
++        TextView message = new TextView(context);
++        message.setText(state == WAITING ? "Preparing preview…" : "Preview could not be prepared.");
++        message.setTextColor(TEXT);
++        message.setTextSize(16f);
++        message.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
++        message.setContentDescription(state == WAITING
++                ? "Preparing video preview" : "Video preview could not be prepared");
++
++        if (state == WAITING) {
++            ProgressBar progress = new ProgressBar(context);
++            progress.setIndeterminate(true);
++            progress.setContentDescription("Preparing preview");
++            LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
++                    dp(context, 22), dp(context, 22));
++            progressParams.rightMargin = dp(context, 12);
++            panel.addView(progress, progressParams);
++            panel.addView(message, new LinearLayout.LayoutParams(
++                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++        } else {
++            message.setText("Preview could not be prepared. Use Back to return.");
++            panel.addView(message, new LinearLayout.LayoutParams(
++                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++            Button back = new Button(context);
++            back.setText("Back");
++            back.setAllCaps(false);
++            back.setTextColor(TEXT);
++            back.setContentDescription("Return from the video preview");
++            back.setOnClickListener(ignored -> {
++                Activity activity = editorActivity;
++                if (activity != null && targetEditor(activity) == activity) {
++                    activity.onBackPressed();
++                    clearState();
++                }
++            });
++            LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(
++                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
++            backParams.gravity = Gravity.END;
++            backParams.topMargin = dp(context, 8);
++            panel.addView(back, backParams);
++        }
++
++        int maxWidth = Math.min(editorRoot.getWidth() - dp(context, 48), dp(context, 360));
++        if (maxWidth <= 0) maxWidth = ViewGroup.LayoutParams.WRAP_CONTENT;
++        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
++                maxWidth, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
++        try {
++            editorRoot.addView(panel, params);
++            statusPanel = panel;
++            editorRoot.invalidate();
++        } catch (Throwable ignored) {
++            statusPanel = null;
++        }
++    }
++
++    private static void removePanel() {
++        if (statusPanel == null) return;
++        ViewGroup parent = statusPanel.getParent() instanceof ViewGroup
++                ? (ViewGroup) statusPanel.getParent() : null;
++        if (parent != null) {
++            try { parent.removeView(statusPanel); } catch (Throwable ignored) {}
++            parent.invalidate();
++        }
++        statusPanel = null;
++    }
++
++    private static GradientDrawable background(Context context) {
++        GradientDrawable d = new GradientDrawable();
++        d.setColor(PANEL);
++        d.setCornerRadius(dp(context, 16));
++        return d;
++    }
++
++    private static int dp(Context context, float value) {
++        return Math.round(value * context.getResources().getDisplayMetrics().density);
++    }
++
++    private static boolean runOnMain(Runnable action) {
++        if (Looper.myLooper() == Looper.getMainLooper()) {
++            action.run();
++            return true;
++        }
++        return MAIN.post(action);
++    }
++
++    private static Activity targetEditor(Activity activity) {
++        if (activity == null || !isEditorRoute(activity)) return null;
++        try {
++            PackageInfo info = activity.getPackageManager().getPackageInfo(PACKAGE, 0);
++            if (info == null || !VERSION.equals(info.versionName)) return null;
++            ClassLoader loader = activity.getClass().getClassLoader();
++            Class<?> lifecycle = Class.forName("com.macapk.loader.FragmentLifecycle", false, loader);
++            Method lookup = lifecycle.getDeclaredMethod("viaFragmentManagerClass", Activity.class, ClassLoader.class);
++            lookup.setAccessible(true);
++            Object manager = lookup.invoke(null, activity, loader);
++            Object store = field(manager, "A0V");
++            Object raw = field(store, "A01");
++            if (!(raw instanceof List<?> fragments)) return null;
++            for (Object fragment : fragments) {
++                if (fragment == null || !"X.CXg".equals(fragment.getClass().getName())) continue;
++                Object model = field(fragment, "A05");
++                Object selected = field(model, "A0x");
++                if (selected instanceof List<?> rows && !rows.isEmpty()) return activity;
++            }
++            return null;
++        } catch (Throwable ignored) {
++            return null;
++        }
++    }
++
++    private static boolean isEditorRoute(Activity activity) {
++        try {
++            if (!PACKAGE.equals(activity.getPackageName())
++                    || !"com.instagram.modal.TransparentModalActivity".equals(activity.getClass().getName()))
++                return false;
++            return ROUTE.equals(activity.getIntent().getStringExtra("fragment_name"));
++        } catch (Throwable ignored) {
++            return false;
++        }
++    }
++
++    private static Object field(Object object, String name) throws Exception {
++        for (Class<?> type = object.getClass(); type != null; type = type.getSuperclass()) {
++            try {
++                Field f = type.getDeclaredField(name);
++                f.setAccessible(true);
++                return f.get(object);
++            } catch (NoSuchFieldException ignored) {}
++        }
++        throw new NoSuchFieldException(name);
++    }
++}

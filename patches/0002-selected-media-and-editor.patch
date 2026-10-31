@@ -1,0 +1,637 @@
+diff --git a/runtime/java/android/graphics/BitmapFactory.java b/runtime/java/android/graphics/BitmapFactory.java
+--- a/runtime/java/android/graphics/BitmapFactory.java
++++ b/runtime/java/android/graphics/BitmapFactory.java
+@@ -643,6 +643,13 @@
+     }
+     public static Bitmap decodeFile(String pathName, Options opts) {
+         if (pathName == null) return null;
++        if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(pathName)) {
++            Options.validate(opts);
++            macapkResetOut(opts);
++            try (var descriptor = com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(pathName)) {
++                return decodeFileDescriptor(descriptor.getFileDescriptor(), null, opts);
++            } catch (java.io.IOException unavailable) { return null; }
++        }
+         if (opts != null && opts.inJustDecodeBounds) {
+             Options.validate(opts);
+             macapkResetOut(opts);
+diff --git a/runtime/java/android/media/MediaPlayer.java b/runtime/java/android/media/MediaPlayer.java
+--- a/runtime/java/android/media/MediaPlayer.java
++++ b/runtime/java/android/media/MediaPlayer.java
+@@ -81,7 +81,7 @@
+         com.macapk.loader.AudioTrace.hit("MediaPlayer.setDataSource(path)", path);
+         localSource = null;
+         String local = path != null && path.startsWith("file://") ? path.substring(7) : path;
+-        if (local != null && new java.io.File(local).isFile()
++        if (local != null && (new java.io.File(local).isFile() || local.matches("/dev/fd/[0-9]+"))
+                 && com.macapk.loader.DocumentPickerHandler.macapkReadVideoMetadata(local) != null) {
+             localSource = local; pendingSource = null; return;
+         }
+diff --git a/runtime/java/android/os/ServiceManager.java b/runtime/java/android/os/ServiceManager.java
+--- a/runtime/java/android/os/ServiceManager.java
++++ b/runtime/java/android/os/ServiceManager.java
+@@ -4,22 +4,22 @@
+  * android.os.ServiceManager -- a HIDDEN (@hide) platform class apps reach only
+  * by reflection to look up system-service binders. AOSP:
+  *   frameworks/base/core/java/android/os/ServiceManager.java
+- * Mac.apk has no binder / servicemanager, so every lookup honestly reports
+- * "not available" (null), exactly as a device does for a service the process
+- * has no permission for. Facebook's lacrima crash reporter references it to
++ * Mac.apk provides a local window-policy binder. Other service lookups report
++ * "not available" (null). Facebook's lacrima crash reporter references it to
+  * install a "system binder died detector" (X.0a3.<init>); without the class the
+  * reference is a NoClassDefFoundError that the reporter logs and swallows, but
+  * the class must exist for a caller that reflects getMethod("getService", ...)
+  * and only catches ReflectiveOperationException.
+  *
+- * Everything returns null / empty: there are no binders to hand out, and a
+- * null IBinder is the documented result for an absent service.
++ * Unknown services remain absent; there is no remote Binder transport.
+  */
+ public final class ServiceManager {
+     private ServiceManager() {}
+ 
+-    public static IBinder getService(String name) { return null; }
+-    public static IBinder checkService(String name) { return null; }
++    public static IBinder getService(String name) {
++        return "window".equals(name) ? WindowService.BINDER : null;
++    }
++    public static IBinder checkService(String name) { return getService(name); }
+     public static IBinder getServiceOrThrow(String name) throws Exception { return null; }
+     public static IBinder waitForService(String name) { return null; }
+     public static IBinder waitForDeclaredService(String name) { return null; }
+@@ -31,4 +31,8 @@
+     public static boolean isDeclared(String name) { return false; }
+     public static String[] getDeclaredInstances(String iface) { return new String[0]; }
+     public static void initServiceCache(java.util.Map<String, IBinder> cache) {}
++
++    private static final class WindowService {
++        static final IBinder BINDER = new android.view.IWindowManager.Stub();
++    }
+ }
+diff --git a/runtime/java/android/provider/MediaStoreProvider.java b/runtime/java/android/provider/MediaStoreProvider.java
+--- a/runtime/java/android/provider/MediaStoreProvider.java
++++ b/runtime/java/android/provider/MediaStoreProvider.java
+@@ -149,6 +149,7 @@
+ 
+     // ---- physical schema (column names are MediaStore's own constants) --
+     private static final String TABLE = "files";
++    private static final String SELECTED_TABLE = "macapk_selected_refs";
+     /** Bump on ANY column add/change -- onCreate drops and re-scans on mismatch. */
+     private static final int SCHEMA_VERSION = 3;   // 2: + datetaken; 3: + AudioColumns/playlists
+ 
+@@ -365,7 +366,7 @@
+ 
+     public MediaStoreProvider() {}
+ 
+-    /** Import an explicitly chosen host file into this app's normal gallery. */
++    /** Remember an explicitly chosen original. No media bytes are copied. */
+     public static Uri macapkImportMedia(android.content.Context context, File source) throws IOException {
+         if (context == null || source == null || !source.isFile() || !source.canRead()) return null;
+         String name = source.getName();
+@@ -376,61 +377,101 @@
+                 && kind != MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO) return null;
+         android.content.ContentProvider registered = android.content.ContentProviderRegistry.get(MediaStore.AUTHORITY);
+         if (!(registered instanceof MediaStoreProvider)) throw new IOException("MediaStore is unavailable");
++        File original = source.getCanonicalFile();
++        String alias = com.macapk.loader.DocumentPickerHandler.macapkReadOnlySelectedMedia(original.getPath());
++        if (alias == null)
++            throw new IOException("Read-only selected-file protection is unavailable");
+         String owner = context.getPackageName();
+-        File directory = new File(Environment.getExternalStorageDirectory(),
+-                Environment.DIRECTORY_DCIM + "/Mac Imports/" + owner.replaceAll("[^A-Za-z0-9._-]", "_"));
+-        Files.createDirectories(directory.toPath());
+-        java.nio.file.Path copied = Files.createTempFile(directory.toPath(), "Mac-", "." + extension);
+-        try {
+-            Files.copy(source.toPath(), copied, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+-            Uri uri = ((MediaStoreProvider) registered).indexHostImport(copied.toFile(), owner, kind);
++        {
++            Uri uri = ((MediaStoreProvider) registered).indexHostImport(original, alias, owner, kind);
+             android.content.ContentResolver resolver = context.getContentResolver();
+             resolver.notifyChange(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null);
+             resolver.notifyChange(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, null);
+             resolver.notifyChange(MediaStore.Files.getContentUri("external"), null);
+             return uri;
+-        } catch (Throwable failure) {
+-            Files.deleteIfExists(copied);
+-            if (failure instanceof IOException) throw (IOException) failure;
+-            throw new IOException("Could not import selected media", failure);
+         }
+     }
+ 
+-    private Uri indexHostImport(File copied, String owner, int kind) throws IOException {
++    private Uri indexHostImport(File original, String alias, String owner, int kind) throws IOException {
+         long[] video = null;
+         if (kind == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO) {
+-            video = com.macapk.loader.DocumentPickerHandler.macapkReadVideoMetadata(copied.getAbsolutePath());
++            video = com.macapk.loader.DocumentPickerHandler.macapkReadVideoMetadata(alias);
+             if (video == null || video.length < 4 || video[0] <= 0 || video[1] <= 0 || video[2] <= 0)
+                 throw new IOException("Selected video metadata is unavailable");
+         }
+-        syncOne(copied, Environment.getExternalStorageDirectory(), new HashMap<>(), new HashSet<>());
+         ContentValues ownership = new ContentValues();
++        ownership.put(COL_DATA, alias);
++        ownership.put(COL_DISPLAY_NAME, original.getName());
++        ownership.put(COL_TITLE, stripExtension(original.getName()));
++        ownership.put(COL_MEDIA_TYPE, kind);
++        String extension = original.getName().substring(original.getName().lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
++        ownership.put(COL_MIME_TYPE, MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension));
++        ownership.put(COL_SIZE, original.length());
++        ownership.put(COL_DATE_ADDED, System.currentTimeMillis() / 1000);
++        ownership.put(COL_DATE_MOD, original.lastModified() / 1000);
++        ownership.put(COL_DATE_TAKEN, original.lastModified());
++        ownership.put(COL_BUCKET_ID, "Selected".hashCode());
++        ownership.put(COL_BUCKET_NAME, "Selected files");
++        ownership.put(COL_REL_PATH, "Selected/");
++        ownership.put(COL_VOLUME_NAME, MediaStore.VOLUME_EXTERNAL_PRIMARY);
++        ownership.put(COL_IS_PENDING, 0);
++        ownership.put(COL_IS_TRASHED, 0);
+         ownership.put(COL_OWNER_PKG, owner);
+         if (video != null) {
+             ownership.put(COL_WIDTH, video[0]);
+             ownership.put(COL_HEIGHT, video[1]);
+             ownership.put(COL_DURATION, video[2]);
+             ownership.put(COL_ORIENTATION, video[3]);
++        } else {
++            android.graphics.BitmapFactory.Options bounds = new android.graphics.BitmapFactory.Options();
++            bounds.inJustDecodeBounds = true;
++            try (ParcelFileDescriptor descriptor = com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(alias)) {
++                android.graphics.BitmapFactory.decodeFileDescriptor(descriptor.getFileDescriptor(), null, bounds);
++            }
++            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw new IOException("Selected image metadata is unavailable");
++            ownership.put(COL_WIDTH, bounds.outWidth);
++            ownership.put(COL_HEIGHT, bounds.outHeight);
+         }
+-        mDb.update(TABLE, ownership, COL_DATA + "=?", new String[] {copied.getAbsolutePath()});
++        mDb.update(TABLE, ownership, COL_DATA + "=?", new String[] {alias});
++        try (Cursor prior = mDb.query(TABLE, new String[]{COL_ID}, COL_DATA + "=?",
++                new String[]{alias}, null, null, null)) {
++            if (prior == null || !prior.moveToFirst()) mDb.insert(TABLE, null, ownership);
++        }
+         try (Cursor row = mDb.query(TABLE, new String[] {COL_ID}, COL_DATA + "=?",
+-                new String[] {copied.getAbsolutePath()}, null, null, null)) {
++                new String[] {alias}, null, null, null)) {
+             if (row != null && row.moveToFirst()) {
+                 Uri collection = kind == MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE
+                         ? MediaStore.Images.Media.EXTERNAL_CONTENT_URI : MediaStore.Video.Media.EXTERNAL_CONTENT_URI;
+-                return android.content.ContentUris.withAppendedId(collection, row.getLong(0));
++                long id = row.getLong(0);
++                ContentValues reference = new ContentValues();
++                reference.put("media_id", id);
++                reference.put("owner", owner);
++                reference.put("original_path", original.getCanonicalPath());
++                reference.put("file_key", selectedFileKey(original));
++                reference.put("ready", 1);
++                if (mDb.insertWithOnConflict(SELECTED_TABLE, null, reference, SQLiteDatabase.CONFLICT_REPLACE) < 0)
++                    throw new IOException("Selected media reference was not saved");
++                return android.content.ContentUris.withAppendedId(collection, id);
+             }
+         }
+         throw new IOException("Imported media was not indexed");
+     }
+ 
+     private String callerAccessWhere(int kind, boolean downloadsOnly, int permissions) {
+-        String clause = accessWhere(kind, downloadsOnly, permissions);
+-        if (clause == null || getContext() == null) return clause;
+-        String owner = getContext().getPackageName();
+-        return owner == null ? clause : "(" + clause + ") OR " + COL_OWNER_PKG + "='" + owner.replace("'", "''") + "'";
++        String owner = getContext() == null ? null : getContext().getPackageName();
++        if (owner == null) return "0";
++        return COL_ID + " IN (SELECT media_id FROM " + SELECTED_TABLE
++            + " WHERE ready=1 AND owner='" + owner.replace("'", "''") + "')";
+     }
+ 
++    private static String selectedFileKey(File file) {
++        try {
++            Object key = Files.readAttributes(file.toPath(), BasicFileAttributes.class).fileKey();
++            return key == null ? null : key.toString();
++        }
++        catch (IOException missing) { return null; }
++    }
++
+     // ---- lifecycle ---------------------------------------------------
+     @Override
+     public boolean onCreate() {
+@@ -467,6 +508,32 @@
+                 try { mDb.execSQL("PRAGMA user_version = " + SCHEMA_VERSION); } catch (Throwable ignored) {}
+             }
+             mDb.execSQL(CREATE_TABLE_SQL);
++            mDb.execSQL("CREATE TABLE IF NOT EXISTS " + SELECTED_TABLE
++                + " (media_id INTEGER NOT NULL, owner TEXT NOT NULL, original_path TEXT NOT NULL,"
++                + " file_key TEXT NOT NULL, ready INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(media_id,owner))");
++            ContentValues inactive = new ContentValues();
++            inactive.put("ready", 0);
++            mDb.update(SELECTED_TABLE, inactive, null, null);
++            mDb.execSQL("UPDATE " + TABLE + " SET " + COL_DATA + "='/__macapk_unavailable_selected__/' || "
++                + COL_ID + " WHERE " + COL_ID + " IN (SELECT media_id FROM " + SELECTED_TABLE + ")");
++            try (Cursor references = mDb.query(SELECTED_TABLE, new String[]{"media_id", "original_path", "file_key"},
++                    null, null, null, null, null)) {
++                while (references != null && references.moveToNext()) {
++                    String path = references.getString(1);
++                    if (!com.macapk.loader.NativeOs.mediaFileAvailable(path)) continue;
++                    String fileKey = selectedFileKey(new File(path));
++                    if (fileKey == null || !fileKey.equals(references.getString(2))) continue;
++                    String selectedAlias = com.macapk.loader.DocumentPickerHandler.macapkReadOnlySelectedMedia(path);
++                    if (selectedAlias != null) {
++                        ContentValues data = new ContentValues();
++                        data.put(COL_DATA, selectedAlias);
++                        mDb.update(TABLE, data, COL_ID + "=?", new String[]{references.getString(0)});
++                        ContentValues active = new ContentValues();
++                        active.put("ready", 1);
++                        mDb.update(SELECTED_TABLE, active, "media_id=?", new String[]{references.getString(0)});
++                    }
++                }
++            }
+             mDb.execSQL(CREATE_MAP_SQL);
+             if (photosEnabled()) {
+                 mDb.execSQL(CREATE_PHOTOS_SQL);
+@@ -963,7 +1030,8 @@
+         Long id = extractId(seg, route);
+         if (id == null) return route.dirType;
+         if (mDb != null) {
+-            try (Cursor c = mDb.query(TABLE, new String[]{COL_MIME_TYPE}, COL_ID + "=?",
++            try (Cursor c = mDb.query(TABLE, new String[]{COL_MIME_TYPE}, COL_ID + "=? AND ("
++                    + callerAccessWhere(route.mediaTypeFilter, route.downloadsOnly, access()) + ")",
+                     new String[]{String.valueOf(id)}, null, null, null)) {
+                 if (c != null && c.moveToFirst()) {
+                     String m = c.getString(0);
+@@ -1029,23 +1097,8 @@
+             // answer here.
+             Sub sub = subFor(seg);
+             if (sub != null) {
+-                if (mDb == null) return null;
+-                // AOSP AccessChecker: the thumbnail tables follow their media
+-                // collection, and the parsed audio tables (albums, artists,
+-                // genres, playlist members) are NO_ACCESS_SQL without
+-                // READ_MEDIA_AUDIO -- "callers need to hold READ_MEDIA_AUDIO".
+-                if (!subVisible(seg.size() > 1 ? seg.get(1) : "", access())) {
+-                    com.macapk.loader.NativeLog.i(TAG, "query -> rows=0 sub=" + uri.getPath()
+-                        + " (no read permission for this collection)");
+-                    return new MatrixCursor(cols);
+-                }
+-                if (sub.needsSync) sync(false);      // audio sub-tables: never a Photos row
+-                Cursor out = derivedQuery(sub, cols, selection, selectionArgs, sortOrder);
+-                try {
+-                    com.macapk.loader.NativeLog.i(TAG, "query -> rows="
+-                        + (out == null ? -1 : out.getCount()) + " sub=" + uri.getPath());
+-                } catch (Throwable ignored) {}
+-                return out;
++                // No derived legacy collection may expose media that was not selected.
++                return new MatrixCursor(cols);
+             }
+             com.macapk.loader.NativeLog.w(TAG, "query: unrecognized media URI " + uri);
+             // AOSP: an unmatched UriMatcher throws IllegalArgumentException from
+@@ -1122,7 +1175,7 @@
+         // ever filtered the READ path, so an app with just READ_MEDIA_IMAGES
+         // could open, and truncate, the user's own ~/Pictures photo through a
+         // "w" mode.
+-        if (modeWantsWrite(pfdMode) && !writeAllowed(a)) {
++        if (mode != null && !"r".equals(mode)) {
+             throw new SecurityException("no write access to " + uri);
+         }
+ 
+@@ -1164,7 +1217,7 @@
+             }
+         }
+         if (!f.exists()) throw new FileNotFoundException(path);
+-        return ParcelFileDescriptor.open(f, pfdMode);
++        return com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(path);
+     }
+ 
+     /** AOSP MediaProvider.openTypedAssetFileCommon (packages/providers/MediaProvider
+@@ -1341,28 +1394,7 @@
+     // Queries read the committed index. Scanning never holds the provider
+     // monitor or a write transaction while it reads host metadata.
+     private synchronized void sync(boolean mayPrompt) {
+-        mScanMayPrompt |= mayPrompt;
+-        if (mScanClosed || mDb == null || mScanRunning) return;
+-        long now = System.nanoTime();
+-        if (mLastScanNanos != 0 && now - mLastScanNanos < TimeUnit.SECONDS.toNanos(5)) return;
+-        mLastScanNanos = now;
+-        mScanRunning = true;
+-        Thread scanner = new Thread(() -> {
+-            boolean changed = false;
+-            try { changed = scanVolume(mayPrompt); }
+-            catch (Throwable failure) { com.macapk.loader.NativeLog.w(TAG, "scan failed: " + failure); }
+-            finally {
+-                synchronized (this) { mScanRunning = false; }
+-            }
+-            if (changed && !mScanClosed && getContext() != null) {
+-                android.content.ContentResolver resolver = getContext().getContentResolver();
+-                resolver.notifyChange(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null);
+-                resolver.notifyChange(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, null);
+-                resolver.notifyChange(MediaStore.Files.getContentUri("external"), null);
+-            }
+-        }, "macapk-media-scan");
+-        scanner.setDaemon(true);
+-        scanner.start();
++        // Selection is the only index input. Never scan host folders or Photos.
+     }
+ 
+     private long databaseChanges() {
+@@ -2653,8 +2685,7 @@
+ 
+     /** MACAPK_PHOTOKIT, default ON. */
+     static boolean photosEnabled() {
+-        String e = System.getenv("MACAPK_PHOTOKIT");
+-        return e == null || e.isEmpty() || e.charAt(0) != '0';
++        return false;
+     }
+ 
+     /** The diagnostic directory backend, or null for PhotoKit. */
+diff --git a/runtime/java/android/view/IWindowManager.java b/runtime/java/android/view/IWindowManager.java
+new file mode 100644
+--- /dev/null
++++ b/runtime/java/android/view/IWindowManager.java
+@@ -0,0 +1,30 @@
++package android.view;
++
++import android.os.Binder;
++import android.os.IBinder;
++import android.os.IInterface;
++
++/** Local window policy queried by apps through Android's hidden service API. */
++public interface IWindowManager extends IInterface {
++    boolean hasNavigationBar();
++    boolean hasNavigationBar(int displayId);
++
++    /** Only the in-process service is supported; there is no remote Binder proxy. */
++    public static class Stub extends Binder implements IWindowManager {
++        private static final String DESCRIPTOR = "android.view.IWindowManager";
++
++        public Stub() { attachInterface(this, DESCRIPTOR); }
++
++        public static IWindowManager asInterface(IBinder binder) {
++            if (binder == null) return null;
++            IInterface local = binder.queryLocalInterface(DESCRIPTOR);
++            return local instanceof IWindowManager ? (IWindowManager) local : null;
++        }
++
++        public IBinder asBinder() { return this; }
++        public boolean hasNavigationBar() {
++            return com.macapk.loader.StatusBarDriver.systemBarsEnabled();
++        }
++        public boolean hasNavigationBar(int displayId) { return hasNavigationBar(); }
++    }
++}
+diff --git a/runtime/java/com/macapk/loader/DocumentPickerHandler.java b/runtime/java/com/macapk/loader/DocumentPickerHandler.java
+--- a/runtime/java/com/macapk/loader/DocumentPickerHandler.java
++++ b/runtime/java/com/macapk/loader/DocumentPickerHandler.java
+@@ -48,6 +48,7 @@
+ import android.provider.DocumentsProvider;
+ 
+ import java.io.File;
++import java.io.IOException;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+@@ -78,7 +79,7 @@
+     private static final AtomicLong sSeq = new AtomicLong(1);
+     private static final ConcurrentHashMap<Long, Activity> sImports = new ConcurrentHashMap<>();
+     private static final ConcurrentHashMap<Long, java.util.function.Consumer<Uri>> sMediaBrowses = new ConcurrentHashMap<>();
+-    private static boolean sMediaBrowseActive; // owner looper only, includes the file-copy phase
++    private static boolean sMediaBrowseActive; // owner looper only, includes reference registration
+     private static final String INSTAGRAM_PACKAGE = "com.instagram.android";
+     private static final String INSTAGRAM_SHARE = "com.instagram.share.handleractivity.ShareHandlerActivity";
+ 
+@@ -100,6 +101,34 @@
+     static Uri importPickedMedia(android.content.Context context, String[] paths) throws java.io.IOException {
+         if (paths == null || paths.length != 1 || paths[0] == null) return null;
+         return android.provider.MediaStoreProvider.macapkImportMedia(context, new File(paths[0]));
++    }
++
++    /** Fail closed until the native file-access boundary protects this original. */
++    public static String macapkReadOnlySelectedMedia(String path) {
++        if (path == null) return null;
++        try { return nativeReadOnlySelectedMedia(path); }
++        catch (UnsatisfiedLinkError unavailable) { return null; }
++    }
++
++    public static boolean macapkIsSelectedMediaReference(String alias) {
++        if (alias == null || !alias.startsWith("/dev/fd/")) return false;
++        try { return nativeIsSelectedMediaReference(alias); }
++        catch (UnsatisfiedLinkError unavailable) { return false; }
++    }
++
++    /** Each provider reader gets a separate read-only offset, never the anchor's offset. */
++    public static android.os.ParcelFileDescriptor macapkOpenSelectedMedia(String alias) throws java.io.FileNotFoundException {
++        java.io.FileDescriptor descriptor;
++        try { descriptor = nativeOpenSelectedMedia(alias); }
++        catch (UnsatisfiedLinkError unavailable) { descriptor = null; }
++        if (descriptor == null) throw new java.io.FileNotFoundException("Selected reference is unavailable");
++        java.io.FileInputStream stream = new java.io.FileInputStream(descriptor);
++        try {
++            return android.os.ParcelFileDescriptor.macapkWrap(descriptor, stream, stream.getChannel().size());
++        } catch (IOException failure) {
++            try { stream.close(); } catch (IOException ignored) {}
++            throw new java.io.FileNotFoundException("Selected reference is unavailable");
++        }
+     }
+ 
+     /** File metadata only. Called by the gallery import worker, never the UI thread. */
+@@ -535,6 +564,9 @@
+     private static native long[] nativeVideoMetadata(String path);
+     private static native byte[] nativeVideoFrame(String path, long timeUs, int option, int width, int height);
+     private static native String nativeVideoPath(java.io.FileDescriptor fd);
++    private static native String nativeReadOnlySelectedMedia(String path);
++    private static native java.io.FileDescriptor nativeOpenSelectedMedia(String alias);
++    private static native boolean nativeIsSelectedMediaReference(String alias);
+ 
+     /** The same panel with a mode (MODE_OPEN / MODE_SAVE / MODE_TREE) and a
+      *  starting directory (null = where it last was). Registered separately and
+diff --git a/runtime/src/document_picker.mm b/runtime/src/document_picker.mm
+--- a/runtime/src/document_picker.mm
++++ b/runtime/src/document_picker.mm
+@@ -51,6 +51,9 @@
+ #include <algorithm>
+ #include <climits>
+ #include <vector>
++#include <map>
++#include <mutex>
++#include <unistd.h>
+ 
+ namespace macapk {
+ namespace docpicker {
+@@ -62,6 +65,38 @@
+ static jmethodID g_import_image = nullptr;
+ static jmethodID g_can_import_image = nullptr;
+ 
++// Keep each selected descriptor alive for this process. An Android media model
++// may retain its DATA string after leaving the picker, so descriptors are never reused.
++static std::mutex g_selected_mutex;
++static std::map<std::string, int> g_selected_fds;
++static NSString* jstr(JNIEnv* env, jstring s);
++
++static jstring nativeReadOnlySelectedMedia(JNIEnv* env, jclass, jstring input) {
++  @autoreleasepool {
++    if (!input) return nullptr;
++    NSString* path = jstr(env, input);
++    if (!path) return nullptr;
++    int fd = ::open(path.fileSystemRepresentation, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (fd < 0) return nullptr;
++    struct stat status{};
++    if (fstat(fd, &status) || !S_ISREG(status.st_mode)) { close(fd); return nullptr; }
++    std::string key = std::to_string(status.st_dev) + ":" + std::to_string(status.st_ino);
++    std::lock_guard<std::mutex> lock(g_selected_mutex);
++    auto prior = g_selected_fds.find(key);
++    if (prior != g_selected_fds.end()) { close(fd); fd = prior->second; }
++    else {
++        if (g_selected_fds.size() >= 256) { close(fd); return nullptr; }
++        // Fail closed if this host does not preserve read-only access through fdescfs.
++        std::string alias = "/dev/fd/" + std::to_string(fd);
++        int writable = ::open(alias.c_str(), O_RDWR);
++        if (writable >= 0) { close(writable); close(fd); return nullptr; }
++        g_selected_fds.emplace(key, fd);
++    }
++    std::string alias = "/dev/fd/" + std::to_string(fd);
++    return env->NewStringUTF(alias.c_str());
++  }
++}
++
+ static JNIEnv* attachedEnv() {
+     if (!g_vm) return nullptr;
+     JNIEnv* env = nullptr;
+@@ -132,6 +167,61 @@
+     return out;
+ }
+ 
++// AVFoundation may delegate reads to another process, where /dev/fd/N belongs
++// to that process. Resolve only inside this host reader; DATA remains the alias.
++static NSString* mediaReadPath(NSString* path) {
++    if (![path hasPrefix:@"/dev/fd/"]) return path;
++    const char* number = path.UTF8String + 8;
++    char* end = nullptr;
++    long fd = strtol(number, &end, 10);
++    if (!number[0] || !end || *end || fd < 0 || fd > INT_MAX) return nil;
++    char original[PATH_MAX];
++    int flags = fcntl((int)fd, F_GETFL);
++    if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY || fcntl((int)fd, F_GETPATH, original)) return nil;
++    return [[NSFileManager defaultManager] stringWithFileSystemRepresentation:original length:strlen(original)];
++}
++
++static jobject nativeOpenSelectedMedia(JNIEnv* env, jclass, jstring input) {
++  @autoreleasepool {
++    NSString* alias = jstr(env, input);
++    if (![alias hasPrefix:@"/dev/fd/"]) return nullptr;
++    char* end = nullptr;
++    long anchor = strtol(alias.UTF8String + 8, &end, 10);
++    if (!end || *end || anchor < 0 || anchor > INT_MAX) return nullptr;
++    std::lock_guard<std::mutex> lock(g_selected_mutex);
++    bool selected = false;
++    for (const auto& entry : g_selected_fds) if (entry.second == anchor) { selected = true; break; }
++    if (!selected) return nullptr;
++    NSString* original = mediaReadPath(alias);
++    if (!original) return nullptr;
++    int fd = ::open(original.fileSystemRepresentation, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (fd < 0) return nullptr;
++    struct stat a{}, b{};
++    if (fstat((int)anchor, &a) || fstat(fd, &b) || a.st_dev != b.st_dev || a.st_ino != b.st_ino) { close(fd); return nullptr; }
++    jclass cls = env->FindClass("java/io/FileDescriptor");
++    jmethodID constructor = cls ? env->GetMethodID(cls, "<init>", "()V") : nullptr;
++    jfieldID field = cls ? env->GetFieldID(cls, "fd", "I") : nullptr;
++    jobject result = constructor && field ? env->NewObject(cls, constructor) : nullptr;
++    if (result) env->SetIntField(result, field, fd); else close(fd);
++    if (cls) env->DeleteLocalRef(cls);
++    return result;
++  }
++}
++
++static jboolean nativeIsSelectedMediaReference(JNIEnv* env, jclass, jstring input) {
++  @autoreleasepool {
++    NSString* alias = jstr(env, input);
++    if (![alias hasPrefix:@"/dev/fd/"]) return JNI_FALSE;
++    const char* number = alias.UTF8String + 8;
++    char* end = nullptr;
++    long fd = strtol(number, &end, 10);
++    if (!number[0] || !end || *end || fd < 0 || fd > INT_MAX) return JNI_FALSE;
++    std::lock_guard<std::mutex> lock(g_selected_mutex);
++    for (const auto& entry : g_selected_fds) if (entry.second == fd) return JNI_TRUE;
++    return JNI_FALSE;
++  }
++}
++
+ static NSMutableArray<NSString*>* jstrs(JNIEnv* env, jobjectArray a) {
+     NSMutableArray<NSString*>* out = [NSMutableArray array];
+     jsize n = a ? env->GetArrayLength(a) : 0;
+@@ -265,7 +355,7 @@
+ 
+ static jlongArray nativeVideoMetadata(JNIEnv* env, jclass, jstring path_j) {
+   @autoreleasepool {
+-    NSString* path = jstr(env, path_j);
++    NSString* path = mediaReadPath(jstr(env, path_j));
+     if (!path.length) return nullptr;
+     AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+     AVAssetTrack* track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+@@ -288,6 +378,18 @@
+     const_cast<char*>("nativePick"),
+     const_cast<char*>("(ZZ[Ljava/lang/String;Ljava/lang/String;J)Z"),
+     reinterpret_cast<void*>(nativePick)};
++static const JNINativeMethod kSelectedReadOnly = {
++    const_cast<char*>("nativeReadOnlySelectedMedia"),
++    const_cast<char*>("(Ljava/lang/String;)Ljava/lang/String;"),
++    reinterpret_cast<void*>(nativeReadOnlySelectedMedia)};
++static const JNINativeMethod kOpenSelected = {
++    const_cast<char*>("nativeOpenSelectedMedia"),
++    const_cast<char*>("(Ljava/lang/String;)Ljava/io/FileDescriptor;"),
++    reinterpret_cast<void*>(nativeOpenSelectedMedia)};
++static const JNINativeMethod kIsSelected = {
++    const_cast<char*>("nativeIsSelectedMediaReference"),
++    const_cast<char*>("(Ljava/lang/String;)Z"),
++    reinterpret_cast<void*>(nativeIsSelectedMediaReference)};
+ 
+ static const JNINativeMethod kPickEx = {
+     const_cast<char*>("nativePickEx"),
+@@ -300,7 +402,7 @@
+ static jbyteArray nativeVideoFrame(JNIEnv* env, jclass, jstring path_j, jlong timeUs,
+                                    jint option, jint width, jint height) {
+   @autoreleasepool {
+-    NSString* path = jstr(env, path_j);
++    NSString* path = mediaReadPath(jstr(env, path_j));
+     if (!path.length || option < 0 || option > 3 || width < 0 || height < 0) return nullptr;
+     AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+     if (![asset tracksWithMediaType:AVMediaTypeVideo].count) return nullptr;
+@@ -388,6 +490,9 @@
+     if (env->RegisterNatives(cls, &kVideoMetadata, 1) != JNI_OK) env->ExceptionClear();
+     if (env->RegisterNatives(cls, &kVideoFrame, 1) != JNI_OK) env->ExceptionClear();
+     if (env->RegisterNatives(cls, &kVideoPath, 1) != JNI_OK) env->ExceptionClear();
++    if (env->RegisterNatives(cls, &kSelectedReadOnly, 1) != JNI_OK) env->ExceptionClear();
++    if (env->RegisterNatives(cls, &kOpenSelected, 1) != JNI_OK) env->ExceptionClear();
++    if (env->RegisterNatives(cls, &kIsSelected, 1) != JNI_OK) env->ExceptionClear();
+     g_on_picked = env->GetStaticMethodID(cls, "macapkOnPicked", "(J[Ljava/lang/String;)V");
+     if (!g_on_picked) { env->ExceptionClear(); env->DeleteLocalRef(cls); return; }
+     g_block_reason = env->GetStaticMethodID(cls, "macapkTreeBlockReason",
+diff --git a/runtime/src/video_toolbox.mm b/runtime/src/video_toolbox.mm
+--- a/runtime/src/video_toolbox.mm
++++ b/runtime/src/video_toolbox.mm
+@@ -1276,6 +1276,9 @@
+ 
+ // BEGIN mediaplayer-file-video
+ #include "app_volume.h"
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ extern "C" float macapk_audio_master_volume();
+ // AVPlayer owns file demux, audio and presentation time. Frames use the same
+ // retained CVPixelBuffer -> NativeMedia -> scoped SurfaceTexture route as codecs.
+@@ -1308,6 +1311,21 @@
+     if (!chars) return 0;
+     NSString* path = [NSString stringWithCharacters:(const unichar*)chars length:env->GetStringLength(input)];
+     env->ReleaseStringChars(input, chars);
++    if ([path hasPrefix:@"/dev/fd/"]) {
++        NSString* descriptor = [path substringFromIndex:8];
++        if (descriptor.length == 0 || [descriptor rangeOfCharacterFromSet:
++                [[NSCharacterSet decimalDigitCharacterSet] invertedSet]].location != NSNotFound) return 0;
++        int fd = open(path.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
++        if (fd < 0) return 0;
++        struct stat status;
++        char resolved[PATH_MAX];
++        bool valid = fstat(fd, &status) == 0 && S_ISREG(status.st_mode)
++            && fcntl(fd, F_GETPATH, resolved) == 0;
++        close(fd);
++        if (!valid) return 0;
++        // AVFoundation needs a regular file URL; the resolved path stays native.
++        path = [NSString stringWithUTF8String:resolved];
++    }
+     AVURLAsset* asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+     AVAssetTrack* track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+     double seconds = CMTimeGetSeconds(asset.duration);

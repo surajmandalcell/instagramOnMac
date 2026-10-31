@@ -1,0 +1,137 @@
+--- a/runtime/java/com/macapk/loader/ClassFileRewriter.java
++++ b/runtime/java/com/macapk/loader/ClassFileRewriter.java
+@@ -178,10 +178,11 @@
+         boolean selectedGallery = matchesSelectedGallery(raw, className);
+         boolean selectedMetadata = matchesSelectedMetadata(raw, className);
+         boolean selectedPreview = matchesSelectedPreview(raw, className);
++        boolean selectedImport = matchesSelectedImport(raw, className);
+         boolean selectedCanonical = containsNeedle(raw, "getCanonicalPath".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+             || containsNeedle(raw, "getCanonicalFile".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+         if (PRESCAN_ENABLED) {
+-            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || selectedPreview || selectedCanonical || needsFullParse(raw, className);
++            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || selectedPreview || selectedImport || selectedCanonical || needsFullParse(raw, className);
+             if (PRESCAN_STATS) {
+                 long seen = prescanSeen.incrementAndGet();
+                 if (needsParse) prescanFullParsed.incrementAndGet();
+@@ -488,6 +489,13 @@
+                     if (m.code != null && "setVideoPath".equals(cf.utf8(m.nameIndex))
+                             && "(Ljava/lang/String;LX/rBz;)V".equals(cf.utf8(m.descIndex)))
+                         hits += redirectSelectedPreview(cf, m.code);
++                }
++            }
++            if (selectedImport) {
++                for (MethodEntry m : cf.methods) {
++                    if (m.code != null && "<init>".equals(cf.utf8(m.nameIndex))
++                            && "(Lcom/instagram/common/gallery/Medium;Lcom/instagram/unifieddatamodel/video/ProvenanceMetadata;III)V".equals(cf.utf8(m.descIndex)))
++                        hits += redirectSelectedImport(cf, m.code);
+                 }
+             }
+             if (hits > 0) {
+@@ -1110,6 +1118,31 @@
+                     writeU2(bytes, pc + 1, cf.findOrAddMethodref(cls, nameType));
+                     hits++;
+                 }
++            }
++            pc += length;
++        }
++        return hits;
++    }
++
++    private static boolean matchesSelectedImport(byte[] raw, String name) {
++        if (!"X.90w".equals(name) && !"X/90w".equals(name)) return false;
++        try { return "8d3406031504eb13bedcce9a4876839e054cb3af30f9e841248b0f33a9ab749e".equals(
++                java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
++        } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
++    }
++
++    private static int redirectSelectedImport(ClassFile cf, CodeAttr code) {
++        int hits = 0;
++        for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
++            int op = code.code[pc] & 255, length = instructionLength(op, code.code, pc);
++            if (length <= 0) break;
++            if (op == 0xb4 && isFieldref(cf, u2(code.code, pc + 1),
++                    "com/instagram/common/gallery/Medium", "A0e", "Ljava/lang/String;")) {
++                int owner = cf.findOrAddClass("com/macapk/loader/MovCompatibilityCache");
++                int type = cf.findOrAddNameAndType("preparedImportPath", "(Ljava/lang/Object;)Ljava/lang/String;");
++                code.code[pc] = (byte) OP_INVOKESTATIC;
++                writeU2(code.code, pc + 1, cf.findOrAddMethodref(owner, type));
++                hits++;
+             }
+             pc += length;
+         }
+@@ -1431,6 +1464,13 @@
+             && desc.equals(cf.utf8(cf.nameAndTypeDescriptor(ntIdx)));
+     }
+ 
++    private static boolean isFieldref(ClassFile cf, int index, String owner, String name, String descriptor) {
++        int type = cf.fieldrefClass(index), pair = cf.fieldrefNameAndType(index);
++        return type >= 0 && pair >= 0 && owner.equals(cf.classNameOf(type))
++            && name.equals(cf.utf8(cf.nameAndTypeName(pair)))
++            && descriptor.equals(cf.utf8(cf.nameAndTypeDescriptor(pair)));
++    }
++
+     /** True if the Methodref (or InterfaceMethodref) CP entry at
+      *  methodrefIdx targets exactly java/lang/System.runFinalizersOnExit
+      *  (Z)V -- the one JDK-11-removed libcore back-compat API confirmed so
+--- a/runtime/java/com/macapk/loader/MovCompatibilityCache.java
++++ b/runtime/java/com/macapk/loader/MovCompatibilityCache.java
+@@ -27,6 +27,7 @@
+             });
+     private static final class Job {
+         volatile Snapshot snapshot = new Snapshot(State.WAITING, 0, null);
++        volatile File output;
+         final CompletableFuture<File> future = new CompletableFuture<>();
+     }
+     private MovCompatibilityCache() {}
+@@ -47,12 +48,24 @@
+     public static String readyAliasForSelectedData(String alias) {
+         Job job = alias == null ? null : ALIASES.get(alias);
+         if (job == null || job.snapshot.state() != State.READY) return alias;
+-        File output = job.future.getNow(null);
++        File output = job.output;
+         if (output == null || !output.isFile() || output.length() == 0) return alias;
+         String derived = DocumentPickerHandler.macapkReadOnlySelectedMedia(output.getPath());
+         if (derived == null) return alias;
+         ALIASES.put(derived, job); return derived;
+     }
++    /** Import models need a regular MP4 filename; gallery identity remains the original descriptor. */
++    public static String preparedImportPath(Object medium) throws ReflectiveOperationException {
++        String alias = (String) medium.getClass().getField("A0e").get(medium);
++        Job job = alias == null ? null : ALIASES.get(alias);
++        if (job == null || job.snapshot.state() != State.READY
++                || !DocumentPickerHandler.macapkIsSelectedMediaReference(alias)) return alias;
++        File output = job.output;
++        if (output == null || !output.isFile() || output.length() == 0) return alias;
++        String path = output.getAbsolutePath();
++        ALIASES.put(path, job);
++        return path;
++    }
+     public static void bindUri(Uri uri, String alias) {
+         Job job = ALIASES.get(alias); if (uri != null && job != null) URIS.put(uri.toString(), job);
+     }
+@@ -72,7 +85,7 @@
+         if (alias != null) ALIASES.put(alias, job);
+         if (prior != null) {
+             if (job.snapshot.state() == State.READY) {
+-                File cached = job.future.getNow(null);
++                File cached = job.output;
+                 if (cached == null || !cached.isFile() || cached.length() == 0
+                         || DocumentPickerHandler.macapkReadVideoMetadata(cached.getPath()) == null) {
+                     JOBS.remove(key, job); return prepare(context, original, alias);
+@@ -90,7 +103,7 @@
+     }
+     private static void ownerOnly(java.nio.file.Path path, boolean directory) throws IOException {
+         if (Files.getFileStore(path).supportsFileAttributeView("posix"))
+-            Files.setPosixFilePermissions(path, java.nio.file.attribute.PosixFilePermissions.fromString(directory ? "rwx------" : "rw-------"));
++            Files.setPosixFilePermissions(path, java.nio.file.attribute.PosixFilePermissions.fromString(directory ? "rwx------" : "r--------"));
+     }
+     private static void convert(Job job, File original, String alias, File directory, String key, BasicFileAttributes before) {
+         File output = new File(directory, key + ".mp4"), part = new File(directory, key + ".part.mp4");
+@@ -111,6 +124,7 @@
+                 Files.move(part.toPath(), output.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+             }
+             ownerOnly(output.toPath(), false);
++            job.output = output;
+             job.snapshot = new Snapshot(State.READY, 1, null); job.future.complete(output);
+         } catch (Throwable failure) {
+             try { Files.deleteIfExists(part.toPath()); } catch (IOException ignored) {}

@@ -1,0 +1,600 @@
+--- a/runtime/java/android/media/MediaCodec.java
++++ b/runtime/java/android/media/MediaCodec.java
+@@ -243,26 +243,10 @@
+         return new MediaCodec("OMX.macapk.dec." + type);
+     }
+ 
+-    /** There is NO encoder behind MediaCodec at all -- MediaCodecList registers
+-     *  zero of them, configure() ignores CONFIGURE_FLAG_ENCODE entirely, and
+-     *  createInputSurface() returns null. So this returned a DECODER under an
+-     *  encoder name: an app "encoding" got its PCM fed through an AAC decoder,
+-     *  or NPE'd on the null input surface.
+-     *
+-     *  Throwing IOException here rather than IllegalArgumentException at
+-     *  configure() is deliberate. IOException is what AOSP documents for "the
+-     *  codec cannot be created", it is a CHECKED exception the callers already
+-     *  handle, and it lands inside the corpus caller's protected range: Subway
+-     *  Surfers' NatCorder wraps createEncoderByType in a try/catch(IOException)
+-     *  but invokes createInputSurface() OUTSIDE it, so today's null-surface NPE
+-     *  escapes its constructor while this throw takes its graceful path.
+-     *
+-     *  macOS itself reports 16 encode formats including AAC, so this is a
+-     *  Mac.apk gap, not a host gap -- the honest interim answer, not the
+-     *  terminal one. Rung 1 is AudioConverter + VTCompressionSession; see
+-     *  docs/media-audio-camera-parity-audit_2026-08-30.md. */
++    /** AVC surface encoding uses VideoToolbox. Other encoders fail explicitly. */
+     public static MediaCodec createEncoderByType(String type) throws java.io.IOException {
+         java.util.Objects.requireNonNull(type, "type");
++        if ("video/avc".equalsIgnoreCase(type)) return new MediaCodec("OMX.macapk.enc.video/avc");
+         throw new java.io.IOException("no encoder for " + type
+                 + " on this host (MediaCodec encoding is not implemented)");
+     }
+@@ -298,6 +282,9 @@
+     // the actual native session, opened at start().
+     private long mVidDec = 0;
+     private boolean mIsVideo = false;
++    private boolean mEncoderMode;
++    private com.macapk.loader.NativeVideoEncoder mEncoder;
++    private com.macapk.loader.NativeVideoEncoder.Packet mEncoderPending;
+     private String mVidMime;
+     private int mVidWidth, mVidHeight;
+     private byte[] mCsd0Vid, mCsd1Vid;
+@@ -373,6 +360,18 @@
+     public void configure(MediaFormat format, android.view.Surface surface,
+                           MediaCrypto crypto, int flags) {
+         if (format == null) return;
++        if (mEncoder != null) { mEncoder.release(); mEncoder = null; }
++        mEncoderMode = (flags & CONFIGURE_FLAG_ENCODE) != 0;
++        if (mEncoderMode) {
++            if (!"video/avc".equalsIgnoreCase(format.getString(MediaFormat.KEY_MIME, ""))
++                    || format.getInteger(MediaFormat.KEY_COLOR_FORMAT, MediaFormat.COLOR_FormatSurface) != MediaFormat.COLOR_FormatSurface)
++                throw new IllegalArgumentException("Only AVC surface encoding is supported");
++            mEncoder = new com.macapk.loader.NativeVideoEncoder(format);
++            mIsVideo = true; mFormatId = 0; mSurface = null; mHasSurface = false;
++            mVidWidth = format.getInteger(MediaFormat.KEY_WIDTH); mVidHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
++            mVidMime = "video/avc"; mStatMime = mVidMime;
++            return;
++        }
+         String mime = format.getString(MediaFormat.KEY_MIME, "");
+         mStatMime = mime;
+         mFormatId = 0;
+@@ -554,7 +553,10 @@
+ 
+     public void start() {
+         synchronized (mAsyncLock) {
+-            if (mFormatId != 0 && mSampleRate > 0 && mChannels > 0) {
++            if (mEncoderMode) {
++                if (mEncoder == null) throw new IllegalStateException("Encoder is not configured");
++                mEncoder.start();
++            } else if (mFormatId != 0 && mSampleRate > 0 && mChannels > 0) {
+                 mDec = com.macapk.loader.NativeMedia.nativeDecOpen(mFormatId, mSampleRate, mChannels, mCsd0);
+                 if (mDec == 0) {
+                     // Loud, not silent -- the same reasoning as the video
+@@ -597,10 +599,10 @@
+             }
+             mIn  = new ByteBuffer[IN_BUFS];
+             mOut = new ByteBuffer[OUT_BUFS];
+-            mOutPixbuf = mIsVideo ? new long[OUT_BUFS] : null;
+-            mOutPts    = mIsVideo ? new long[OUT_BUFS] : null;
++            mOutPixbuf = mIsVideo && !mEncoderMode ? new long[OUT_BUFS] : null;
++            mOutPts    = mIsVideo && !mEncoderMode ? new long[OUT_BUFS] : null;
+             mInFree.clear(); mOutFree.clear(); mOutQ.clear();
+-            for (int i = 0; i < IN_BUFS;  i++) { mIn[i] = ByteBuffer.allocateDirect(mInCap); mInFree.add(i); }
++            if (!mEncoderMode) for (int i = 0; i < IN_BUFS;  i++) { mIn[i] = ByteBuffer.allocateDirect(mInCap); mInFree.add(i); }
+             for (int i = 0; i < OUT_BUFS; i++) mOutFree.add(i);
+             mStarted = true; mFormatReported = false;
+             com.macapk.loader.MediaStats.codecStart(mStat, mStatMime, mHasSurface);
+@@ -750,6 +752,7 @@
+     }
+     private void releaseDec() {
+         synchronized (mAsyncLock) {
++            if (mEncoder != null) { mEncoder.release(); mEncoder = null; mEncoderPending = null; }
+             if (mDec != 0) { com.macapk.loader.NativeMedia.nativeDecClose(mDec); mDec = 0; }
+             if (mVidDec != 0) {
+                 releasePendingVideoFrames();
+@@ -869,7 +872,7 @@
+     // surface". Even without a surface our video output is an opaque native
+     // pixel buffer with no meaningful ByteBuffer view -- use getOutputImage.
+     public ByteBuffer getOutputBuffer(int index) {
+-        if (mIsVideo) return null;
++        if (mIsVideo && !mEncoderMode) return null;
+         return (mOut != null && index >= 0 && index < mOut.length) ? mOut[index] : null;
+     }
+     public Image getInputImage(int index) { return null; }
+@@ -1192,6 +1195,26 @@
+     }
+     private int tryDequeueOutputLocked0(BufferInfo info) {
+         if (!mStarted) return INFO_TRY_AGAIN_LATER;
++        if (mEncoderMode) {
++            if (mEncoder == null || mOutFree.isEmpty()) return INFO_TRY_AGAIN_LATER;
++            if (mEncoderPending == null) mEncoderPending = mEncoder.pollPacket();
++            if (!mFormatReported) {
++                if (mEncoder.outputFormat() == null) {
++                    if (mEncoderPending == null || (mEncoderPending.flags() & BUFFER_FLAG_END_OF_STREAM) == 0)
++                        return INFO_TRY_AGAIN_LATER;
++                    mFormatReported = true;
++                } else {
++                    mFormatReported = true; return INFO_OUTPUT_FORMAT_CHANGED;
++                }
++            }
++            if (mEncoderPending == null) return INFO_TRY_AGAIN_LATER;
++            int index = mOutFree.poll();
++            mOut[index] = ByteBuffer.allocateDirect(mEncoderPending.bytes().length);
++            mOut[index].put(mEncoderPending.bytes()).flip();
++            info.set(0, mEncoderPending.bytes().length, mEncoderPending.ptsUs(), mEncoderPending.flags());
++            mEncoderPending = null;
++            return index;
++        }
+         // AOSP reports the output format once before the first buffer.
+         if (!mFormatReported) { mFormatReported = true; return INFO_OUTPUT_FORMAT_CHANGED; }
+         if (mVidDec != 0) {
+@@ -1422,6 +1445,11 @@
+     }
+ 
+     public MediaFormat getOutputFormat() {
++        if (mEncoderMode) {
++            MediaFormat format = mEncoder == null ? null : mEncoder.outputFormat();
++            if (format == null) throw new IllegalStateException("Encoder format is not available yet");
++            return format;
++        }
+         if (mIsVideo) {
+             MediaFormat f = MediaFormat.createVideoFormat(mVidMime, mVidWidth, mVidHeight);
+             f.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+@@ -1483,8 +1511,14 @@
+     public void subscribeToVendorParameters(java.util.List<String> names) { }
+     public void unsubscribeFromVendorParameters(java.util.List<String> names) { }
+ 
+-    public android.view.Surface createInputSurface() { return null; }
+-    public void signalEndOfInputStream() { }
++    public android.view.Surface createInputSurface() {
++        if (!mEncoderMode || mEncoder == null) throw new IllegalStateException("Codec is not a configured surface encoder");
++        return mEncoder.inputSurface();
++    }
++    public void signalEndOfInputStream() {
++        if (!mEncoderMode || mEncoder == null || !mStarted) throw new IllegalStateException("Encoder is not running");
++        mEncoder.endInput();
++    }
+     public void detachOutputSurface() { }
+ 
+     // =====================================================================
+@@ -1494,11 +1528,8 @@
+     //
+     // Two families land here, both of which this backend genuinely lacks, and
+     // both of which report that the AOSP way rather than by pretending:
+-    //   * ENCODE (createPersistentInputSurface / setInputSurface). The native
+-    //     bridge is decode-only -- com.macapk.loader.NativeMedia has
+-    //     nativeDecOpen/nativeVidDecode and no encoder counterpart -- so there
+-    //     is no producer to hand a surface to. createInputSurface() above
+-    //     already returns null for the same reason.
++    //   * Persistent encoder input (createPersistentInputSurface / setInputSurface).
++    //     AVC encoding currently owns one input Surface per codec instance.
+     //   * The BLOCK MODEL (getQueueRequest / getOutputFrame / LinearBlock).
+     //     AOSP itself throws IllegalStateException from these unless the codec
+     //     was configured with CONFIGURE_FLAG_USE_BLOCK_MODEL, and this backend
+@@ -1507,8 +1538,7 @@
+ 
+     /**
+      * API 23. A surface that can be reused across several encoder sessions.
+-     * AOSP returns a real surface from the codec service; there is no encoder
+-     * here, so this returns the same empty, no-producer Surface the rest of this
++     * Persistent encoder surfaces are not implemented, so this returns the same empty, no-producer Surface the rest of this
+      * tree hands out for a sink that consumes nothing -- non-null, because
+      * AOSP's contract is @NonNull and an app that gets null here NPEs at its
+      * own setInputSurface call instead of learning anything.
+@@ -1519,8 +1549,7 @@
+ 
+     /**
+      * API 23. Feeds an encoder from a persistent input surface. AOSP throws
+-     * IllegalStateException when the codec is not a configured encoder -- which
+-     * it never is here (no encoder backend) -- so that is the answer, rather
++     * Persistent input cannot bind to the current encoder backend, so fail rather
+      * than accepting a surface whose frames go nowhere.
+      */
+     public void setInputSurface(android.view.Surface surface) {
+--- /dev/null
++++ b/runtime/java/com/macapk/loader/NativeVideoEncoder.java
+@@ -0,0 +1,111 @@
++package com.macapk.loader;
++
++import android.graphics.SurfaceTexture;
++import android.media.MediaFormat;
++import android.view.Surface;
++import java.nio.ByteBuffer;
++
++/** AVC surface encoder backed by the host VideoToolbox compression session. */
++public final class NativeVideoEncoder {
++    public static native long open(int width, int height, int bitrate, int fps, int keyIntervalSeconds);
++    public static native int queueArgb(long handle, int[] argb, int width, int height, long ptsUs);
++    public static native byte[] poll(long handle, long[] info);
++    public static native byte[] csd(long handle, int index);
++    public static native int end(long handle);
++    public static native void close(long handle);
++
++    public record Packet(byte[] bytes, long ptsUs, int flags) {}
++    private final Object lock = new Object();
++    private final int width, height, bitrate, fps, keyInterval;
++    private final InputTexture texture;
++    private Surface surface;
++    private long handle;
++    private boolean closed, ended;
++
++    public NativeVideoEncoder(MediaFormat format) {
++        width = format.getInteger(MediaFormat.KEY_WIDTH);
++        height = format.getInteger(MediaFormat.KEY_HEIGHT);
++        bitrate = format.getInteger(MediaFormat.KEY_BIT_RATE, 5_000_000);
++        fps = Math.max(1, format.getNumber(MediaFormat.KEY_FRAME_RATE, 30).intValue());
++        keyInterval = Math.max(0, format.getNumber(MediaFormat.KEY_I_FRAME_INTERVAL, 1).intValue());
++        if (width <= 0 || height <= 0 || bitrate <= 0) throw new IllegalArgumentException("Invalid AVC encoder format");
++        texture = new InputTexture();
++        texture.setDefaultBufferSize(width, height);
++    }
++
++    public Surface inputSurface() {
++        synchronized (lock) {
++            if (closed) throw new IllegalStateException("Encoder is closed");
++            if (surface == null) surface = Surface.macapkForEncoder(texture);
++            return surface;
++        }
++    }
++    public void start() {
++        synchronized (lock) {
++            if (closed || handle != 0) throw new IllegalStateException("Encoder cannot start");
++            handle = open(width, height, bitrate, fps, keyInterval);
++            if (handle == 0) throw new IllegalStateException("VideoToolbox AVC encoder could not start");
++        }
++    }
++    public Packet pollPacket() {
++        synchronized (lock) {
++            if (handle == 0) return null;
++            long[] info = new long[2];
++            byte[] bytes = poll(handle, info);
++            return bytes == null ? null : new Packet(bytes, info[0], (int) info[1]);
++        }
++    }
++    public MediaFormat outputFormat() {
++        synchronized (lock) {
++            byte[] sps = handle == 0 ? null : csd(handle, 0);
++            byte[] pps = handle == 0 ? null : csd(handle, 1);
++            if (sps == null || pps == null) return null;
++            MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
++            format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
++            format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
++            format.setByteBuffer("csd-0", ByteBuffer.wrap(sps));
++            format.setByteBuffer("csd-1", ByteBuffer.wrap(pps));
++            return format;
++        }
++    }
++    public void endInput() {
++        synchronized (lock) {
++            if (handle == 0 || closed || ended) throw new IllegalStateException("Encoder input is not running");
++            if (end(handle) < 0) throw new IllegalStateException("VideoToolbox encoder could not finish");
++            ended = true;
++        }
++    }
++    public void release() {
++        synchronized (lock) {
++            closed = true;
++            if (handle != 0) { close(handle); handle = 0; }
++            if (surface != null) surface.release();
++            texture.release();
++        }
++    }
++    private final class InputTexture extends SurfaceTexture {
++        private long presentationTimeNs = -1;
++        InputTexture() { super(false); }
++        @Override public void macapkSetProducerPresentationTime(long timeNs) { presentationTimeNs = timeNs; }
++        @Override public void macapkQueueProducerFrame(int[] argb, int w, int h, int stride,
++                float[] transform, java.util.function.Consumer<int[]> recycler, boolean premultiplied) {
++            try {
++                if (stride != w || w != width || h != height) throw new IllegalArgumentException("Encoder input dimensions changed");
++                long ptsUs = presentationTimeNs >= 0 ? presentationTimeNs / 1000 : System.nanoTime() / 1000;
++                long deadline = System.nanoTime() + 5_000_000_000L;
++                for (;;) {
++                    int status;
++                    synchronized (lock) {
++                        if (closed || handle == 0 || ended) throw new IllegalStateException("Encoder input is not running");
++                        status = queueArgb(handle, argb, w, h, ptsUs);
++                    }
++                    if (status == 0) return;
++                    if (status != -11 || System.nanoTime() >= deadline)
++                        throw new IllegalStateException("VideoToolbox encoder rejected input: " + status);
++                    try { Thread.sleep(1); }
++                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IllegalStateException("Encoder input interrupted", interrupted); }
++                }
++            } finally { if (recycler != null) recycler.accept(argb); }
++        }
++    }
++}
+--- a/runtime/java/android/view/Surface.java
++++ b/runtime/java/android/view/Surface.java
+@@ -86,6 +86,12 @@
+     private float mFrameRate;
+ 
+     public Surface() {}
++    /** Encoder input is a producer sink, never the active decoded-video target. */
++    public static Surface macapkForEncoder(android.graphics.SurfaceTexture texture) {
++        Surface surface = new Surface();
++        surface.mSurfaceTexture = texture;
++        return surface;
++    }
+     public Surface(android.graphics.SurfaceTexture surfaceTexture) {
+         mSurfaceTexture = surfaceTexture;
+         // See the file header ("THE VIDEO-DECODE HAND-OFF POINT"). Harmless
+--- a/runtime/java/android/graphics/SurfaceTexture.java
++++ b/runtime/java/android/graphics/SurfaceTexture.java
+@@ -277,6 +277,9 @@
+ 
+     private final java.lang.ref.WeakReference<android.view.View> mSelectedEditorOrigin;
+ 
++    /** EGL producer timestamp; encoder sinks override this without changing display queues. */
++    public void macapkSetProducerPresentationTime(long timeNs) { }
++
+     private void reportSelectedDecodedFrame() {
+         if (com.macapk.loader.InstagramMediaPreparationCompat.wantsSelectedFrameHint())
+             com.macapk.loader.InstagramMediaPreparationCompat.reportDecodedFrame(mSelectedEditorOrigin.get());
+--- a/runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java
++++ b/runtime/java/javax/microedition/khronos/egl/MacApkGlWindow.java
+@@ -94,6 +94,7 @@
+     private volatile int mW, mH;
+     private volatile boolean mDestroyed;
+     private long mFrames;
++    private long mPresentationTimeNs = -1;
+ 
+     // Readback scratch (the swapping thread only) and the recycled frames.
+     private java.nio.ByteBuffer mRgba;
+@@ -243,6 +244,8 @@
+         }
+         // premultipliedSource=true: a GL consumer (updateTexImage) must see the
+         // premultiplied bytes a device buffer holds, not our straight copy.
++        mSt.macapkSetProducerPresentationTime(mPresentationTimeNs);
++        mPresentationTimeNs = -1;
+         mSt.macapkQueueProducerFrame(argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
+         mFrames++;
+     }
+@@ -456,6 +459,13 @@
+         if (old == null) return 0;
+         if (log14()) info14("SurfaceTexture window resized to " + w.mW + "x" + w.mH);
+         return w.mPbuffer.getNativeHandle();
++    }
++
++    public static boolean egl14PresentationTime(long dpy, long surface, long timeNs) {
++        MacApkGlWindow window = EGL14_WINDOWS.get(new Egl14Key(dpy, surface));
++        if (window == null || window.mDestroyed) return false;
++        window.mPresentationTimeNs = timeNs;
++        return true;
+     }
+ 
+     /** EGL14.eglDestroySurface / eglTerminate on a window: disconnect from the
+--- a/runtime/src/egl14_bridges.inc
++++ b/runtime/src/egl14_bridges.inc
+@@ -1147,6 +1147,12 @@
+ // ===================== EGLExt =====================
+ jboolean EGLExt_eglPresentationTimeANDROID(JNIEnv* env, jclass, jobject dpy,
+                                            jobject surf, jlong time) {
++    if (egl14_upcalls(env)) {
++        jmethodID method = env->GetStaticMethodID(g_egl14Up.cls, "egl14PresentationTime", "(JJJ)Z");
++        if (method && env->CallStaticBooleanMethod(g_egl14Up.cls, method,
++                (jlong)(uintptr_t)egl_h(env, dpy), (jlong)(uintptr_t)egl_h(env, surf), time)) return JNI_TRUE;
++        if (env->ExceptionCheck()) return JNI_FALSE;
++    }
+     static auto p = (MEGLBoolean(*)(MEGLDisplay, MEGLSurface, MEGLTime))gl3_resolve("eglPresentationTimeANDROID");
+     void* d = egl_h(env, dpy);
+     return (p && p(d, egl14_win_cur(d, egl_h(env, surf)), time)) ? JNI_TRUE : JNI_FALSE;
+--- /dev/null
++++ b/runtime/src/video_encoder.mm
+@@ -0,0 +1,187 @@
++#import <VideoToolbox/VideoToolbox.h>
++#import <Foundation/Foundation.h>
++#include <jni.h>
++#include <deque>
++#include <mutex>
++#include <vector>
++#include <cstring>
++
++namespace macapk::video_encoder {
++struct Packet { std::vector<uint8_t> bytes; int64_t pts; int flags; };
++struct Encoder {
++    VTCompressionSessionRef session = nullptr;
++    int width, height;
++    std::mutex mutex;
++    std::deque<Packet> packets;
++    std::vector<uint8_t> sps, pps;
++    OSStatus error = noErr;
++    bool ended = false, eosRead = false;
++};
++static void appendNal(std::vector<uint8_t>& dst, const uint8_t* data, size_t size) {
++    const uint8_t prefix[] = {0, 0, 0, 1};
++    dst.insert(dst.end(), prefix, prefix + 4);
++    dst.insert(dst.end(), data, data + size);
++}
++static void encoded(void* context, void*, OSStatus status, VTEncodeInfoFlags flags,
++                    CMSampleBufferRef sample) {
++    Encoder* e = static_cast<Encoder*>(context);
++    std::lock_guard<std::mutex> lock(e->mutex);
++    if (status != noErr || (flags & kVTEncodeInfo_FrameDropped) || !sample) {
++        e->error = status != noErr ? status : -1;
++        return;
++    }
++    CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
++    int nalLength = 4;
++    for (size_t i = 0; i < 2; ++i) {
++        const uint8_t* data = nullptr;
++        size_t size = 0, count = 0;
++        OSStatus result = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
++                format, i, &data, &size, &count, &nalLength);
++        if (result == noErr && data && size) {
++            auto& target = i == 0 ? e->sps : e->pps;
++            target.clear(); appendNal(target, data, size);
++        }
++    }
++    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample);
++    const size_t size = block ? CMBlockBufferGetDataLength(block) : 0;
++    std::vector<uint8_t> avcc(size);
++    if (!size || CMBlockBufferCopyDataBytes(block, 0, size, avcc.data()) != kCMBlockBufferNoErr) {
++        e->error = -2; return;
++    }
++    Packet packet;
++    packet.pts = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample),
++                                   1000000, kCMTimeRoundingMethod_Default).value;
++    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, false);
++    bool notSync = false;
++    if (attachments && CFArrayGetCount(attachments)) {
++        auto dict = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(attachments, 0));
++        notSync = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync) == kCFBooleanTrue;
++    }
++    packet.flags = notSync ? 0 : 1;
++    size_t offset = 0;
++    while (offset + nalLength <= size) {
++        uint32_t length = 0;
++        for (int n = 0; n < nalLength; ++n) length = (length << 8) | avcc[offset++];
++        if (!length || length > size - offset) { e->error = -3; return; }
++        appendNal(packet.bytes, avcc.data() + offset, length);
++        offset += length;
++    }
++    if (offset != size || e->packets.size() >= 8) { e->error = -4; return; }
++    e->packets.push_back(std::move(packet));
++}
++static void number(VTCompressionSessionRef session, CFStringRef key, int value) {
++    CFNumberRef n = CFNumberCreate(nullptr, kCFNumberIntType, &value);
++    VTSessionSetProperty(session, key, n); CFRelease(n);
++}
++static jlong open(JNIEnv*, jclass, jint width, jint height, jint bitrate, jint fps, jint interval) {
++    @autoreleasepool {
++    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || fps <= 0 || fps > 240) return 0;
++    Encoder* e = new Encoder(); e->width = width; e->height = height;
++    NSDictionary* attributes = @{
++        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
++        (id)kCVPixelBufferWidthKey: @(width), (id)kCVPixelBufferHeightKey: @(height),
++        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
++    };
++    NSDictionary* specification = @{
++        (id)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES
++    };
++    OSStatus result = VTCompressionSessionCreate(nullptr, width, height, kCMVideoCodecType_H264,
++        (__bridge CFDictionaryRef)specification, (__bridge CFDictionaryRef)attributes,
++        nullptr, encoded, e, &e->session);
++    if (result != noErr || !e->session) { delete e; return 0; }
++    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
++    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
++    VTSessionSetProperty(e->session, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel);
++    number(e->session, kVTCompressionPropertyKey_AverageBitRate, bitrate > 0 ? bitrate : 5000000);
++    number(e->session, kVTCompressionPropertyKey_ExpectedFrameRate, fps);
++    number(e->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, fps * (interval > 0 ? interval : 1));
++    if (VTCompressionSessionPrepareToEncodeFrames(e->session) != noErr) {
++        VTCompressionSessionInvalidate(e->session); CFRelease(e->session); delete e; return 0;
++    }
++    return reinterpret_cast<jlong>(e);
++    }
++}
++static jint queueArgb(JNIEnv* env, jclass, jlong handle, jintArray argb, jint width, jint height, jlong pts) {
++    Encoder* e = reinterpret_cast<Encoder*>(handle);
++    if (!e || !argb || width != e->width || height != e->height || env->GetArrayLength(argb) < width * height) return -1;
++    {
++        std::lock_guard<std::mutex> lock(e->mutex);
++        if (e->error) return e->error;
++        if (e->ended) return -1;
++        if (e->packets.size() >= 8) return -11;
++    }
++    CVPixelBufferRef pixel = nullptr;
++    CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(e->session);
++    if (!pool || CVPixelBufferPoolCreatePixelBuffer(nullptr, pool, &pixel) != kCVReturnSuccess) return -2;
++    CVPixelBufferLockBaseAddress(pixel, 0);
++    uint8_t* dest = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(pixel));
++    size_t stride = CVPixelBufferGetBytesPerRow(pixel);
++    jint* source = env->GetIntArrayElements(argb, nullptr);
++    if (!source) { CVPixelBufferUnlockBaseAddress(pixel, 0); CFRelease(pixel); return -3; }
++    // Java ARGB ints are BGRA bytes on the supported little-endian Mac hosts.
++    for (int y = 0; y < height; ++y) std::memcpy(dest + y * stride, source + y * width, width * 4);
++    env->ReleaseIntArrayElements(argb, source, JNI_ABORT);
++    CVPixelBufferUnlockBaseAddress(pixel, 0);
++    OSStatus result = VTCompressionSessionEncodeFrame(e->session, pixel, CMTimeMake(pts, 1000000),
++        kCMTimeInvalid, nullptr, nullptr, nullptr);
++    CFRelease(pixel);
++    // Resolve callbacks before returning, bounding retained frame/output memory.
++    if (result == noErr) result = VTCompressionSessionCompleteFrames(e->session, CMTimeMake(pts, 1000000));
++    return result;
++}
++static jbyteArray bytes(JNIEnv* env, const std::vector<uint8_t>& data) {
++    jbyteArray result = env->NewByteArray(static_cast<jsize>(data.size()));
++    if (result && !data.empty()) env->SetByteArrayRegion(result, 0, data.size(), reinterpret_cast<const jbyte*>(data.data()));
++    return result;
++}
++static jbyteArray poll(JNIEnv* env, jclass, jlong handle, jlongArray info) {
++    Encoder* e = reinterpret_cast<Encoder*>(handle);
++    if (!e || !info || env->GetArrayLength(info) < 2) return nullptr;
++    std::lock_guard<std::mutex> lock(e->mutex);
++    if (e->error) {
++        jclass error = env->FindClass("java/lang/IllegalStateException");
++        env->ThrowNew(error, "VideoToolbox encoder failed"); return nullptr;
++    }
++    if (!e->packets.empty()) {
++        Packet& packet = e->packets.front();
++        jlong metadata[] = {packet.pts, packet.flags};
++        env->SetLongArrayRegion(info, 0, 2, metadata);
++        jbyteArray result = bytes(env, packet.bytes); e->packets.pop_front(); return result;
++    }
++    if (e->ended && !e->eosRead) {
++        e->eosRead = true; jlong metadata[] = {0, 4};
++        env->SetLongArrayRegion(info, 0, 2, metadata); return env->NewByteArray(0);
++    }
++    return nullptr;
++}
++static jbyteArray csd(JNIEnv* env, jclass, jlong handle, jint index) {
++    Encoder* e = reinterpret_cast<Encoder*>(handle); if (!e || index < 0 || index > 1) return nullptr;
++    std::lock_guard<std::mutex> lock(e->mutex);
++    const auto& data = index == 0 ? e->sps : e->pps;
++    return data.empty() ? nullptr : bytes(env, data);
++}
++static jint end(JNIEnv*, jclass, jlong handle) {
++    Encoder* e = reinterpret_cast<Encoder*>(handle); if (!e) return -1;
++    OSStatus result = VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
++    std::lock_guard<std::mutex> lock(e->mutex); e->ended = true; return result;
++}
++static void close(JNIEnv*, jclass, jlong handle) {
++    Encoder* e = reinterpret_cast<Encoder*>(handle); if (!e) return;
++    VTCompressionSessionCompleteFrames(e->session, kCMTimeInvalid);
++    VTCompressionSessionInvalidate(e->session); CFRelease(e->session); delete e;
++}
++void RegisterNativeVideoEncoderMethods(JNIEnv* env) {
++    jclass cls = env->FindClass("com/macapk/loader/NativeVideoEncoder");
++    if (!cls) { env->ExceptionClear(); return; }
++    JNINativeMethod methods[] = {
++        {(char*)"open", (char*)"(IIIII)J", (void*)open},
++        {(char*)"queueArgb", (char*)"(J[IIIJ)I", (void*)queueArgb},
++        {(char*)"poll", (char*)"(J[J)[B", (void*)poll},
++        {(char*)"csd", (char*)"(JI)[B", (void*)csd},
++        {(char*)"end", (char*)"(J)I", (void*)end},
++        {(char*)"close", (char*)"(J)V", (void*)close}
++    };
++    env->RegisterNatives(cls, methods, sizeof(methods) / sizeof(methods[0]));
++    env->DeleteLocalRef(cls);
++}
++}
+--- a/runtime/src/native_methods.cpp
++++ b/runtime/src/native_methods.cpp
+@@ -4388,6 +4388,7 @@
+ // RegisterNatives calls against the same jclass, same pattern already used
+ // for NativeLog's kNativeLogMethods/kNativeQos below).
+ namespace video  { void RegisterNativeVideoMethods(JNIEnv* env); }
++namespace video_encoder { void RegisterNativeVideoEncoderMethods(JNIEnv* env); }
+ // Forward-declared from video_vp8_decode.mm; registers NativeMedia's five
+ // VP8-specific natives (nativeVp8Open/_Decode/_Poll/_Flush/_Close, libvpx
+ // software decode -- VideoToolbox has no VP8 decoder on any macOS version).
+@@ -4553,6 +4554,7 @@
+     audioin::RegisterAudioInputMethods(env);
+     media::RegisterNativeMediaMethods(env);
+     video::RegisterNativeVideoMethods(env);
++    video_encoder::RegisterNativeVideoEncoderMethods(env);
+     video_vp8::RegisterNativeVp8Methods(env);
+     video_vp9::RegisterNativeVp9Methods(env);
+     camera::RegisterCameraBridgeMethods(env);
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -176,6 +176,7 @@
+     src/audio_vorbis_decode.mm
+     src/media_video.mm
+     src/video_toolbox.mm
++    src/video_encoder.mm
+     src/video_caps_probe.mm
+     thirdparty/stb_vorbis.c
+     src/cocoa_bridge.mm

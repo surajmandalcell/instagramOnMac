@@ -1,0 +1,119 @@
+--- a/runtime/java/android/provider/MediaStoreProvider.java
++++ b/runtime/java/android/provider/MediaStoreProvider.java
+@@ -511,6 +511,45 @@
+         return selected;
+     }
+ 
++    /** Resolve only selected MediaStore rows. Never expose the original host path. */
++    public static String macapkSelectedPathForUri(Uri uri) {
++        if (uri == null) throw new NullPointerException("uri");
++        String fallback = uri.getPath();
++        if (!"content".equals(uri.getScheme()) || !MediaStore.AUTHORITY.equals(uri.getAuthority())) return fallback;
++        java.util.List<String> parts = uri.getPathSegments();
++        if (parts.isEmpty() || !("external".equals(parts.get(0)) || "external_primary".equals(parts.get(0))
++                || "internal".equals(parts.get(0)))) return fallback;
++        Route route = routeFor(parts);
++        if (route == null || extractId(parts, route) == null) return fallback;
++        android.content.ContentProvider registered = android.content.ContentProviderRegistry.get(MediaStore.AUTHORITY);
++        if (!(registered instanceof MediaStoreProvider provider) || !provider.selectedOnlyCaller()) return fallback;
++        try (Cursor row = provider.query(uri, new String[]{COL_DATA}, null, null, null)) {
++            if (row != null && row.moveToFirst()) {
++                String alias = row.getString(0);
++                if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(alias)) return alias;
++            }
++        }
++        return fallback;
++    }
++
++    /** Native format readers open their own descriptor; give each initialization
++     * an independent read-only cursor instead of the registry's anchor cursor. */
++    public static void macapkInitializeSelectedRetriever(Object retriever, String path) throws Throwable {
++        if (retriever == null || !"com.facebook.ffmpeg.FFMpegMediaMetadataRetriever".equals(retriever.getClass().getName()))
++            throw new IllegalArgumentException("Unexpected metadata reader");
++        java.lang.reflect.Method initialize = retriever.getClass().getDeclaredMethod("nativeInit", String.class);
++        initialize.setAccessible(true);
++        try {
++            if (com.macapk.loader.DocumentPickerHandler.macapkIsSelectedMediaReference(path)) {
++                try (ParcelFileDescriptor fresh = com.macapk.loader.DocumentPickerHandler.macapkOpenSelectedMedia(path)) {
++                    int descriptor = fresh.getFd();
++                    if (descriptor < 0) throw new IOException("Selected metadata descriptor is unavailable");
++                    initialize.invoke(retriever, "/dev/fd/" + descriptor);
++                }
++            } else initialize.invoke(retriever, path);
++        } catch (java.lang.reflect.InvocationTargetException failed) { throw failed.getCause(); }
++    }
++
+     private boolean photosEnabledForCaller() {
+         return !selectedOnlyCaller() && photosEnabled();
+     }
+--- a/runtime/java/com/macapk/loader/ClassFileRewriter.java
++++ b/runtime/java/com/macapk/loader/ClassFileRewriter.java
+@@ -176,8 +176,9 @@
+         boolean accountSections = matchesAccountSections(raw, className);
+         boolean selectedMedium = matchesSelectedMedium(raw, className);
+         boolean selectedGallery = matchesSelectedGallery(raw, className);
++        boolean selectedMetadata = matchesSelectedMetadata(raw, className);
+         if (PRESCAN_ENABLED) {
+-            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || needsFullParse(raw, className);
++            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || needsFullParse(raw, className);
+             if (PRESCAN_STATS) {
+                 long seen = prescanSeen.incrementAndGet();
+                 if (needsParse) prescanFullParsed.incrementAndGet();
+@@ -470,6 +471,14 @@
+                             && "()V".equals(cf.utf8(m.descIndex))) hits += redirectSelectedGallery(cf, m.code);
+                 }
+             }
++            if (selectedMetadata) {
++                for (MethodEntry m : cf.methods) {
++                    String method = cf.utf8(m.nameIndex), descriptor = cf.utf8(m.descIndex);
++                    if (m.code != null && (("BDN".equals(method) && "(Landroid/net/Uri;)LX/90v;".equals(descriptor))
++                            || ("initialize".equals(method) && "()Lcom/facebook/ffmpeg/FFMpegMediaMetadataRetriever;".equals(descriptor))))
++                        hits += redirectSelectedMetadata(cf, m.code);
++                }
++            }
+             if (hits > 0) {
+                 byte[] out = cf.serialize();
+                 if (DEBUG) {
+@@ -1105,6 +1114,42 @@
+         } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
+     }
+ 
++    private static boolean matchesSelectedMetadata(byte[] raw, String name) {
++        String normalized = name == null ? "" : name.replace('/', '.');
++        String fingerprint = "X.HBa".equals(normalized)
++                ? "dd96aebae66b35b83f3e52cca06c8d36b432e2d592b941535848842a0f71409b"
++                : "com.facebook.ffmpeg.FFMpegMediaMetadataRetriever".equals(normalized)
++                ? "2281987440fa86f770c9a7e0abc7daeae03a3f6246a16d75c8740995aafa5180" : null;
++        if (fingerprint == null) return false;
++        try { return fingerprint.equals(java.util.HexFormat.of().formatHex(
++                java.security.MessageDigest.getInstance("SHA-256").digest(raw)));
++        } catch (java.security.NoSuchAlgorithmException impossible) { return false; }
++    }
++
++    private static int redirectSelectedMetadata(ClassFile cf, CodeAttr code) {
++        int hits = 0;
++        for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
++            int op = code.code[pc] & 255, length = instructionLength(op, code.code, pc);
++            if (length <= 0) break;
++            String helper = null, descriptor = null;
++            if (op == 0xb6 && isMethodref(cf, u2(code.code, pc + 1), "android/net/Uri", "getPath", "()Ljava/lang/String;")) {
++                helper = "macapkSelectedPathForUri"; descriptor = "(Landroid/net/Uri;)Ljava/lang/String;";
++            } else if ((op == 0xb6 || op == 0xb7) && isMethodref(cf, u2(code.code, pc + 1),
++                    "com/facebook/ffmpeg/FFMpegMediaMetadataRetriever", "nativeInit", "(Ljava/lang/String;)V")) {
++                helper = "macapkInitializeSelectedRetriever"; descriptor = "(Ljava/lang/Object;Ljava/lang/String;)V";
++            }
++            if (helper != null) {
++                int owner = cf.findOrAddClass("android/provider/MediaStoreProvider");
++                int type = cf.findOrAddNameAndType(helper, descriptor);
++                code.code[pc] = (byte) OP_INVOKESTATIC;
++                writeU2(code.code, pc + 1, cf.findOrAddMethodref(owner, type));
++                hits++;
++            }
++            pc += length;
++        }
++        return hits;
++    }
++
+     private static boolean matchesSelectedGallery(byte[] raw, String name) {
+         if (!"X.D5A".equals(name) && !"X/D5A".equals(name)) return false;
+         try {

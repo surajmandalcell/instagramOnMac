@@ -1,0 +1,74 @@
+--- a/runtime/java/com/macapk/loader/ClassFileRewriter.java
++++ b/runtime/java/com/macapk/loader/ClassFileRewriter.java
+@@ -178,8 +178,10 @@
+         boolean selectedGallery = matchesSelectedGallery(raw, className);
+         boolean selectedMetadata = matchesSelectedMetadata(raw, className);
+         boolean selectedPreview = matchesSelectedPreview(raw, className);
++        boolean selectedCanonical = containsNeedle(raw, "getCanonicalPath".getBytes(java.nio.charset.StandardCharsets.UTF_8))
++            || containsNeedle(raw, "getCanonicalFile".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+         if (PRESCAN_ENABLED) {
+-            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || selectedPreview || needsFullParse(raw, className);
++            boolean needsParse = optionalOptics || accountSections || selectedMedium || selectedGallery || selectedMetadata || selectedPreview || selectedCanonical || needsFullParse(raw, className);
+             if (PRESCAN_STATS) {
+                 long seen = prescanSeen.incrementAndGet();
+                 if (needsParse) prescanFullParsed.incrementAndGet();
+@@ -443,6 +445,7 @@
+ 
+             for (MethodEntry m : cf.methods) {
+                 if (m.code != null) hits += redirectLibraryNames(cf, m.code);
++                if (selectedCanonical && m.code != null) hits += redirectSelectedCanonical(cf, m.code);
+             }
+             if (optionalOptics) {
+                 for (MethodEntry m : cf.methods) {
+@@ -1107,6 +1110,31 @@
+                     writeU2(bytes, pc + 1, cf.findOrAddMethodref(cls, nameType));
+                     hits++;
+                 }
++            }
++            pc += length;
++        }
++        return hits;
++    }
++
++    private static int redirectSelectedCanonical(ClassFile cf, CodeAttr code) {
++        int hits = 0;
++        for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
++            int op = code.code[pc] & 255, length = instructionLength(op, code.code, pc);
++            if (length <= 0) break;
++            String name = null, descriptor = null;
++            if (op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(code.code, pc + 1),
++                    "java/io/File", "getCanonicalPath", "()Ljava/lang/String;")) {
++                name = "macapkCanonicalSelectedPath"; descriptor = "(Ljava/io/File;)Ljava/lang/String;";
++            } else if (op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(code.code, pc + 1),
++                    "java/io/File", "getCanonicalFile", "()Ljava/io/File;")) {
++                name = "macapkCanonicalSelectedFile"; descriptor = "(Ljava/io/File;)Ljava/io/File;";
++            }
++            if (name != null) {
++                int owner = cf.findOrAddClass("com/macapk/loader/DocumentPickerHandler");
++                int type = cf.findOrAddNameAndType(name, descriptor);
++                code.code[pc] = (byte) OP_INVOKESTATIC;
++                writeU2(code.code, pc + 1, cf.findOrAddMethodref(owner, type));
++                hits++;
+             }
+             pc += length;
+         }
+--- a/runtime/java/com/macapk/loader/DocumentPickerHandler.java
++++ b/runtime/java/com/macapk/loader/DocumentPickerHandler.java
+@@ -116,6 +116,17 @@
+         catch (UnsatisfiedLinkError unavailable) { return false; }
+     }
+ 
++    public static String macapkCanonicalSelectedPath(File file) throws IOException {
++        String path = file.getPath();
++        // Darwin realpath can turn a descriptor into /dev/fd/<display-name>,
++        // which is not an openable descriptor. Keep the registered capability.
++        return macapkIsSelectedMediaReference(path) ? path : file.getCanonicalPath();
++    }
++
++    public static File macapkCanonicalSelectedFile(File file) throws IOException {
++        return macapkIsSelectedMediaReference(file.getPath()) ? new File(file.getPath()) : file.getCanonicalFile();
++    }
++
+     /** Each provider reader gets a separate read-only offset, never the anchor's offset. */
+     public static android.os.ParcelFileDescriptor macapkOpenSelectedMedia(String alias) throws java.io.FileNotFoundException {
+         java.io.FileDescriptor descriptor;

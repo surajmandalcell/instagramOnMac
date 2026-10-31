@@ -1,0 +1,84 @@
+--- a/runtime/java/com/macapk/loader/InstagramSurfacePreviewCompat.java
++++ b/runtime/java/com/macapk/loader/InstagramSurfacePreviewCompat.java
+@@ -5,11 +5,23 @@
+ import android.view.Surface;
+ import android.view.SurfaceView;
+ import java.lang.reflect.InvocationTargetException;
++import java.util.IdentityHashMap;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+-/** Replays the current surface to a newly joined renderer in the pinned gallery adapter. */
++/** Ensures an uninitialized renderer receives the pinned adapter's current surface. */
+ public final class InstagramSurfacePreviewCompat {
++    private static final IdentityHashMap<Object, Boolean> PENDING = new IdentityHashMap<>();
++    private static final AtomicInteger LOGS = new AtomicInteger();
+     private InstagramSurfacePreviewCompat() {}
++
++    private static void log(String state) {
++        if (LOGS.getAndUpdate(count -> Math.min(count + 1, 32)) < 32) NativeLog.i("SurfacePreview", state);
++    }
++
++    private static boolean initialized(Object consumer) throws ReflectiveOperationException {
++        return field(consumer, "A09") != null || field(consumer, "A08") != null || field(consumer, "A0A") != null;
++    }
+ 
+     private static Object field(Object owner, String name) throws ReflectiveOperationException {
+         return owner.getClass().getField(name).get(owner);
+@@ -20,29 +32,45 @@
+                 || !"X.HC4".equals(consumer.getClass().getName())) return;
+         try {
+             Object broadcaster = field(adapter, "A0D");
+-            if (!(field(broadcaster, "A00") instanceof Set<?> members) || members.contains(consumer)) return;
+-            Handler.macapkCreateOwnerOnly(Looper.getMainLooper()).post(() -> deliver(adapter, consumer, members));
+-        } catch (ReflectiveOperationException unsupportedShape) { }
++            if (!(field(broadcaster, "A00") instanceof Set<?> members)) return;
++            boolean ready = initialized(consumer);
++            if (ready) { log("entry type=HC4 member=" + members.contains(consumer) + " initialized=true"); return; }
++            synchronized (PENDING) {
++                if (PENDING.put(consumer, Boolean.TRUE) != null) return;
++            }
++            log("entry type=HC4 member=" + members.contains(consumer) + " initialized=false");
++            boolean posted = false;
++            try {
++                posted = Handler.macapkCreateOwnerOnly(Looper.getMainLooper()).post(() -> {
++                    try { deliver(adapter, consumer, members); }
++                    finally { synchronized (PENDING) { PENDING.remove(consumer); } }
++                });
++            } finally {
++                if (!posted) synchronized (PENDING) { PENDING.remove(consumer); }
++            }
++        } catch (ReflectiveOperationException unsupportedShape) { log("entry shape=" + unsupportedShape.getClass().getName()); }
+     }
+ 
+     private static void deliver(Object adapter, Object consumer, Set<?> members) {
+         try {
+-            if (!members.contains(consumer) || !(field(adapter, "A0B") instanceof SurfaceView view)
+-                    || !view.isAttachedToWindow() || !view.isShown() || view.getWidth() <= 0 || view.getHeight() <= 0) return;
++            if (!(field(adapter, "A0B") instanceof SurfaceView view)) { log("job view=false"); return; }
+             int width = (Integer) field(adapter, "A03"), height = (Integer) field(adapter, "A02");
+             Object callback = field(adapter, "A07");
+-            if (callback == null || !"X.LPu".equals(callback.getClass().getName()) || (Boolean) field(callback, "A00")) return;
++            boolean pending = callback == null || !"X.LPu".equals(callback.getClass().getName()) || (Boolean) field(callback, "A00");
+             java.lang.reflect.Field created = SurfaceView.class.getDeclaredField("holderSurfaceCreatedFired");
+             created.setAccessible(true);
+-            if (!created.getBoolean(view)) return;
+-            if (width <= 0 || height <= 0 || field(consumer, "A09") != null
+-                    || field(consumer, "A08") != null || field(consumer, "A0A") != null) return;
++            boolean holderCreated = created.getBoolean(view), ready = initialized(consumer), member = members.contains(consumer);
++            log("job type=HC4 member=" + member + " visible=" + view.isShown() + " attached=" + view.isAttachedToWindow()
++                    + " holderCreated=" + holderCreated + " LPuPending=" + pending + " size=" + width + "x" + height + " initialized=" + ready);
++            if (!member || !view.isAttachedToWindow() || !view.isShown() || view.getWidth() <= 0 || view.getHeight() <= 0
++                    || pending || !holderCreated || width <= 0 || height <= 0 || ready) return;
+             Surface surface = view.getHolder().getSurface();
+-            if (!surface.isValid()) return;
++            if (!surface.isValid()) { log("replay surfaceValid=false"); return; }
+             consumer.getClass().getMethod("G3D", Surface.class, int.class, int.class).invoke(consumer, surface, width, height);
++            log("replay completed=true initialized=" + initialized(consumer));
+         } catch (ReflectiveOperationException failure) {
+             Throwable cause = failure instanceof InvocationTargetException invocation ? invocation.getCause() : failure;
+-            NativeLog.e("SurfacePreview", "Late surface handoff failed: " + cause.getClass().getName());
++            log("replay failure=" + cause.getClass().getName());
+         }
+     }
+ }

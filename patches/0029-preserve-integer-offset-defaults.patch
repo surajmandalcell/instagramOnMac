@@ -1,0 +1,14 @@
+--- a/runtime/java/android/content/res/TypedArray.java
++++ b/runtime/java/android/content/res/TypedArray.java
+@@ -1703,7 +1703,10 @@
+             return v == null ? null : v.toString();
+         } catch (Throwable t) { return null; }
+     }
+-    public int getDimensionPixelOffset(int index, int def) { return (int) getDimension(index, def); }
++    public int getDimensionPixelOffset(int index, int def) {
++        float pixels = getDimension(index, Float.NaN);
++        return Float.isNaN(pixels) ? def : (int) pixels;
++    }
+     public float getDimension(int index, float def)       {
+         String v = macapkRawValueAt(index);
+         if (v == null) return def;

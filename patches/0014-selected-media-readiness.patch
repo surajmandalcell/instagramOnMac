@@ -1,0 +1,335 @@
+--- a/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
++++ b/runtime/java/com/macapk/loader/InstagramMediaPreparationCompat.java
+@@ -34,12 +34,19 @@
+     private static final int IDLE = 0, WAITING = 1, FAILED = 2, READY = 3;
+     private static final int PANEL = 0xEB202124;
+     private static final int TEXT = Color.WHITE;
+-    private static final Handler MAIN = new Handler(Looper.getMainLooper());
++    private static Handler mainHandler;
++    private static synchronized Handler mainHandler() {
++        if (mainHandler == null) mainHandler = new Handler(Looper.getMainLooper());
++        return mainHandler;
++    }
+     private static final Map<View, Boolean> FAILURE_POSTED = new WeakHashMap<>();
+ 
+     private static Activity editorActivity;
+-    private static ViewGroup editorRoot;
++    private static volatile ViewGroup editorRoot;
+     private static LinearLayout statusPanel;
++    private static View previewScrim;
++    private static volatile boolean wantsFrameHint;
++    private static volatile boolean decodedFrameAvailable;
+     private static Runnable timeout;
+     private static int state = IDLE;
+     private static long generation;
+@@ -51,7 +58,7 @@
+     public static boolean onRootDraw(View view) {
+         if (view == null || view.getRootView() != view) return true;
+         if (Looper.myLooper() != Looper.getMainLooper()) {
+-            MAIN.post(() -> onRootDrawMain(view));
++            mainHandler().post(() -> onRootDrawMain(view));
+             return true;
+         }
+         return onRootDrawMain(view);
+@@ -69,6 +76,7 @@
+                 if (activity == null) return;
+                 selectActivity(activity);
+                 rendererFailed = true;
++                wantsFrameHint = false;
+                 if (state == FAILED) return;
+                 state = FAILED;
+                 cancelTimeout();
+@@ -80,17 +88,47 @@
+         if (!posted) synchronized (FAILURE_POSTED) { FAILURE_POSTED.remove(origin); }
+     }
+ 
+-    /** Called after the selected editor SurfaceView completes its first EGL14 swap. */
+-    public static void reportFramePresented(View origin) {
+-        runOnMain(() -> {
+-            Activity activity = editorForOrigin(origin);
+-            if (activity == null) return;
+-            selectActivity(activity);
+-            if (state == READY || rendererFailed) return;
+-            state = READY;
+-            cancelTimeout();
+-            removePanel();
+-        });
++    /** A camera SurfaceView swap does not prove that an imported clip is ready. */
++    public static boolean reportFramePresented(View origin) {
++        if (origin == null || origin != editorRoot) return false;
++        if (!wantsFrameHint) return state == READY || rendererFailed;
++        if (!decodedFrameAvailable) return false;
++        return runOnMain(() -> markReady(origin));
++    }
++
++    public static View captureSelectedOriginRoot() {
++        Activity activity = targetEditor(ActivityHost.macapkTopActivity());
++        return activity != null && activity.getWindow() != null
++                ? activity.getWindow().getDecorView() : null;
++    }
++
++    public static void reportDecodedFrame(View origin) {
++        if (wantsFrameHint && origin != null && origin == editorRoot)
++            decodedFrameAvailable = true;
++    }
++
++    private static void markReady(View origin) {
++        Activity activity = editorForOrigin(origin);
++        if (activity == null) return;
++        selectActivity(activity);
++        if (state == READY || rendererFailed) return;
++        state = READY;
++        wantsFrameHint = false;
++        cancelTimeout();
++        removePanel();
++    }
++
++    public static boolean wantsSelectedFrameHint() { return wantsFrameHint; }
++
++    /** Called only after a real, non-camera frame is latched by the selected preview. */
++    public static void reportSelectedFrame(android.view.TextureView preview,
++            android.graphics.SurfaceTexture texture) {
++        if (!wantsFrameHint || !decodedFrameAvailable || preview == null || !preview.isShown()
++                || preview.getWidth() <= 0 || preview.getHeight() <= 0
++                || preview.getSurfaceTexture() != texture || texture == null || texture.macapkHasCameraSource()
++                || texture.macapkLatchGeneration() <= 0) return;
++        View origin = preview.getRootView();
++        runOnMain(() -> markReady(origin));
+     }
+ 
+     /** Native SurfaceView events retain only a weak reference to this decor root. */
+@@ -142,6 +180,7 @@
+         }
+         if (state == IDLE) {
+             state = WAITING;
++            wantsFrameHint = true;
+             scheduleTimeout();
+         }
+         showPanel();
+@@ -156,6 +195,8 @@
+         editorRoot = null;
+         state = IDLE;
+         rendererFailed = false;
++        wantsFrameHint = false;
++        decodedFrameAvailable = false;
+         generation++;
+     }
+ 
+@@ -167,6 +208,8 @@
+         editorRoot = null;
+         state = IDLE;
+         rendererFailed = false;
++        wantsFrameHint = false;
++        decodedFrameAvailable = false;
+         generation++;
+     }
+ 
+@@ -179,11 +222,11 @@
+             timeout = null;
+             showPanel();
+         };
+-        MAIN.postDelayed(timeout, TIMEOUT_MS);
++        mainHandler().postDelayed(timeout, TIMEOUT_MS);
+     }
+ 
+     private static void cancelTimeout() {
+-        if (timeout != null) MAIN.removeCallbacks(timeout);
++        if (timeout != null) mainHandler().removeCallbacks(timeout);
+         timeout = null;
+     }
+ 
+@@ -194,6 +237,13 @@
+         removePanel();
+ 
+         Context context = editorRoot.getContext();
++        View scrim = new View(context);
++        scrim.setBackgroundColor(0xff121212);
++        scrim.setClickable(true);
++        scrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++        editorRoot.addView(scrim, new FrameLayout.LayoutParams(
++                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++        previewScrim = scrim;
+         LinearLayout panel = new LinearLayout(context);
+         panel.setOrientation(state == WAITING ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+         panel.setGravity(Gravity.CENTER_VERTICAL);
+@@ -224,6 +274,14 @@
+             panel.addView(progress, progressParams);
+             panel.addView(message, new LinearLayout.LayoutParams(
+                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++            Button back = new Button(context);
++            back.setText("Back");
++            back.setAllCaps(false);
++            back.setTextColor(TEXT);
++            back.setContentDescription("Return from the video preview");
++            back.setOnClickListener(ignored -> returnFromPreview());
++            panel.addView(back, new LinearLayout.LayoutParams(
++                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+         } else {
+             message.setText("Preview could not be prepared. Use Back to return.");
+             panel.addView(message, new LinearLayout.LayoutParams(
+@@ -233,13 +291,7 @@
+             back.setAllCaps(false);
+             back.setTextColor(TEXT);
+             back.setContentDescription("Return from the video preview");
+-            back.setOnClickListener(ignored -> {
+-                Activity activity = editorActivity;
+-                if (activity != null && targetEditor(activity) == activity) {
+-                    activity.onBackPressed();
+-                    clearState();
+-                }
+-            });
++            back.setOnClickListener(ignored -> returnFromPreview());
+             LinearLayout.LayoutParams backParams = new LinearLayout.LayoutParams(
+                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+             backParams.gravity = Gravity.END;
+@@ -261,6 +313,10 @@
+     }
+ 
+     private static void removePanel() {
++        if (previewScrim != null) {
++            if (previewScrim.getParent() instanceof ViewGroup parent) parent.removeView(previewScrim);
++            previewScrim = null;
++        }
+         if (statusPanel == null) return;
+         ViewGroup parent = statusPanel.getParent() instanceof ViewGroup
+                 ? (ViewGroup) statusPanel.getParent() : null;
+@@ -271,6 +327,14 @@
+         statusPanel = null;
+     }
+ 
++    private static void returnFromPreview() {
++        Activity activity = editorActivity;
++        if (activity != null && targetEditor(activity) == activity) {
++            activity.onBackPressed();
++            clearState();
++        }
++    }
++
+     private static GradientDrawable background(Context context) {
+         GradientDrawable d = new GradientDrawable();
+         d.setColor(PANEL);
+@@ -287,7 +351,7 @@
+             action.run();
+             return true;
+         }
+-        return MAIN.post(action);
++        return mainHandler().post(action);
+     }
+ 
+     private static Activity targetEditor(Activity activity) {
+--- a/runtime/java/android/view/TextureView.java
++++ b/runtime/java/android/view/TextureView.java
+@@ -353,6 +353,9 @@
+             canvas.drawBitmap(frame, mSrcRect, mDstRect, null);
+         }
+         if (fresh) applyUpdate();
++        if (fresh && frame != null && canvas != null
++                && com.macapk.loader.InstagramMediaPreparationCompat.wantsSelectedFrameHint())
++            com.macapk.loader.InstagramMediaPreparationCompat.reportSelectedFrame(this, mSurfaceTexture);
+         mMatrixChanged = false;
+     }
+ 
+--- a/runtime/java/android/graphics/SurfaceTexture.java
++++ b/runtime/java/android/graphics/SurfaceTexture.java
+@@ -243,6 +243,7 @@
+      * @param singleBufferMode whether the SurfaceTexture will be in single buffered mode.
+      */
+     public SurfaceTexture(int texName, boolean singleBufferMode) {
++        mSelectedEditorOrigin = new java.lang.ref.WeakReference<>(com.macapk.loader.InstagramMediaPreparationCompat.captureSelectedOriginRoot());
+         mCreatorLooper = Looper.myLooper();
+         mIsSingleBuffered = singleBufferMode;
+         mTexName = texName;
+@@ -257,6 +258,7 @@
+      * @param singleBufferMode whether the SurfaceTexture will be in single buffered mode.
+      */
+     public SurfaceTexture(boolean singleBufferMode) {
++        mSelectedEditorOrigin = new java.lang.ref.WeakReference<>(com.macapk.loader.InstagramMediaPreparationCompat.captureSelectedOriginRoot());
+         mCreatorLooper = Looper.myLooper();
+         mIsSingleBuffered = singleBufferMode;
+         mTexName = 0;
+@@ -272,7 +274,14 @@
+     public SurfaceTexture() {
+         this(false);
+     }
++
++    private final java.lang.ref.WeakReference<android.view.View> mSelectedEditorOrigin;
+ 
++    private void reportSelectedDecodedFrame() {
++        if (com.macapk.loader.InstagramMediaPreparationCompat.wantsSelectedFrameHint())
++            com.macapk.loader.InstagramMediaPreparationCompat.reportDecodedFrame(mSelectedEditorOrigin.get());
++    }
++
+     /**
+      * Register a callback to be invoked when a new image frame becomes available
+      * to the SurfaceTexture.
+@@ -614,6 +623,7 @@
+                 android.opengl.GLES20.GL_UNSIGNED_BYTE, mLatchRgba);
+             android.opengl.GLES20.glBindTexture(
+                 android.opengl.GLES20.GL_TEXTURE_2D, saved[0]);
++            if (!premul) reportSelectedDecodedFrame();
+         } catch (Throwable t) {
+             if (!sWarnedGlUploadFailed) {
+                 sWarnedGlUploadFailed = true;
+@@ -1208,6 +1218,7 @@
+         int[] vArgb = null;
+         int vW = 0, vH = 0, vStride = 0;
+         java.util.function.Consumer<int[]> vRecycle = null;
++        boolean vPremul = false;
+         synchronized (mLock) {
+             cam = mCamSession;
+             if (mAbandoned) return mLatchBitmap;
+@@ -1226,6 +1237,7 @@
+                 // present path reads, with no GL sampling step to correct for.
+                 vArgb = mVideoFrameArgb; vW = mVideoFrameW; vH = mVideoFrameH;
+                 vStride = mVideoFrameStride;
++                vPremul = mVideoFrameGlPremul;
+                 mCurrentTimestamp = mPendingTimestamp;
+                 mCurrentDataSpace = mPendingDataSpace;
+                 mHasVideoFrame = false;
+@@ -1256,6 +1268,7 @@
+                     mLatchBitmap = latched;
+                     mLatchGeneration++;
+                 }
++                if (!vPremul) reportSelectedDecodedFrame();
+                 return latched;
+             } finally {
+                 // Includes failed copies and a release racing the consumer.
+--- a/runtime/src/egl14_bridges.inc
++++ b/runtime/src/egl14_bridges.inc
+@@ -397,11 +397,15 @@
+         if (entry.dpy == dpy && entry.surface == surface) {
+             if (firstFrame && entry.frameReported) return nullptr;
+             jobject origin = env->NewLocalRef(entry.origin);
+-            if (origin && firstFrame) entry.frameReported = true;
+             return origin;
+         }
+     }
+     return nullptr;
++}
++void egl14_surface_view_ack(void* dpy, void* surface) {
++    Egl14WinLock l;
++    for (Egl14SurfaceView& entry : g_egl14SurfaceViews)
++        if (entry.dpy == dpy && entry.surface == surface) { entry.frameReported = true; return; }
+ }
+ 
+ // The MacApkGlWindow upcalls, resolved once. `create` is published last, so a
+@@ -440,7 +444,7 @@
+     env->DeleteLocalRef(c);
+     jclass mediaCompat = env->FindClass("com/macapk/loader/InstagramMediaPreparationCompat");
+     if (mediaCompat) {
+-        jmethodID reportFrame = env->GetStaticMethodID(mediaCompat, "reportFramePresented", "(Landroid/view/View;)V");
++        jmethodID reportFrame = env->GetStaticMethodID(mediaCompat, "reportFramePresented", "(Landroid/view/View;)Z");
+         jmethodID reportFailure = reportFrame ? env->GetStaticMethodID(mediaCompat, "reportFailure", "(Landroid/view/View;Ljava/lang/String;)V") : nullptr;
+         jmethodID captureOrigin = reportFailure ? env->GetStaticMethodID(mediaCompat, "captureOriginRoot", "(Ljava/lang/Object;)Landroid/view/View;") : nullptr;
+         if (captureOrigin) {
+@@ -993,8 +997,9 @@
+     MEGLBoolean swapped = p ? p(d, egl14_win_cur(d, s)) : 0;
+     jobject origin = swapped ? egl14_surface_view_origin(env, d, s, true) : nullptr;
+     if (origin && g_egl14Up.mediaCompatCls && g_egl14Up.reportFramePresented) {
+-        env->CallStaticVoidMethod(g_egl14Up.mediaCompatCls, g_egl14Up.reportFramePresented, origin);
++        jboolean acknowledged = env->CallStaticBooleanMethod(g_egl14Up.mediaCompatCls, g_egl14Up.reportFramePresented, origin);
+         if (env->ExceptionCheck()) env->ExceptionClear();
++        else if (acknowledged) egl14_surface_view_ack(d, s);
+     }
+     if (origin) env->DeleteLocalRef(origin);
+     return swapped ? JNI_TRUE : JNI_FALSE;

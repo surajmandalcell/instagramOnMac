@@ -1,0 +1,186 @@
+--- a/runtime/java/com/macapk/loader/InstagramGalleryCompat.java
++++ b/runtime/java/com/macapk/loader/InstagramGalleryCompat.java
+@@ -2,10 +2,11 @@
+ 
+ import android.graphics.Canvas;
+ import android.graphics.Paint;
++import android.graphics.Path;
+ import android.view.View;
+ import android.view.ViewGroup;
+ 
+-/** Camera and Mac file browsing inside Instagram's first gallery grid cell. */
++/** Browse Mac files in Instagram's existing first gallery grid cell. */
+ public final class InstagramGalleryCompat {
+     private InstagramGalleryCompat() {}
+     private static final int CAMERA_CELL = 0x7f0b1abb;
+@@ -25,7 +26,7 @@
+                 View child = cell.getChildAt(i);
+                 if (child.getId() == CAMERA_BACKGROUND) { background = child; break; }
+             }
+-            if (isCamera(background)) install(cell, background, cell::performClick,
++            if (isCamera(background)) install(cell, background,
+                     () -> DocumentPickerHandler.macapkBrowseMedia(uri -> {
+                         // MediaStore notifies Recents; Instagram keeps its normal selection flow.
+                     }));
+@@ -53,7 +54,7 @@
+                 && drawable.getIntrinsicWidth() == drawable.getIntrinsicHeight();
+     }
+ 
+-    static SplitTile install(ViewGroup cell, View background, Runnable camera, Runnable browse) {
++    static SplitTile install(ViewGroup cell, View background, Runnable browse) {
+         for (int i = 0; i < cell.getChildCount(); i++)
+             if (cell.getChildAt(i) instanceof SplitTile existing) return existing;
+         ViewGroup.LayoutParams source = background.getLayoutParams();
+@@ -76,25 +77,48 @@
+             return null;
+         }
+         if (!(background instanceof android.widget.ImageView image)) return null;
+-        SplitTile tile = new SplitTile(cell, image, camera, browse);
++        SplitTile tile = new SplitTile(cell, image, browse);
+         cell.addView(tile, layout);
+         return tile;
+     }
+ 
+     static final class SplitTile extends ViewGroup {
+-        final Action camera;
+         final Action browse;
++        private final ViewGroup cell;
+         private final android.widget.ImageView image;
+         private final android.graphics.drawable.Drawable cameraDrawable;
+ 
+-        SplitTile(ViewGroup cell, android.widget.ImageView image, Runnable cameraAction, Runnable browseAction) {
++        private final boolean cellFocusable;
++        private final int cellAccessibility;
++        private final int imageAccessibility;
++        private boolean showing = true;
++
++        SplitTile(ViewGroup cell, android.widget.ImageView image, Runnable browseAction) {
+             super(cell.getContext());
++            this.cell = cell;
+             this.image = image;
+             this.cameraDrawable = image.getDrawable();
+-            camera = new Action(getContext(), "Camera", false, cameraAction);
+-            browse = new Action(getContext(), "Browse", true, browseAction);
+-            addView(camera);
++            cellFocusable = cell.isFocusable();
++            cellAccessibility = cell.getImportantForAccessibility();
++            imageAccessibility = image.getImportantForAccessibility();
++            browse = new Action(getContext(), () -> { if (active()) browseAction.run(); });
+             addView(browse);
++            View.OnClickListener original = null;
++            try {
++                java.lang.reflect.Field listener = View.class.getDeclaredField("onClickListener");
++                listener.setAccessible(true);
++                original = (View.OnClickListener) listener.get(cell);
++            } catch (ReflectiveOperationException unavailable) { /* The overlay still owns normal touch events. */ }
++            View.OnClickListener prior = original;
++            cell.setOnClickListener(view -> {
++                if (active()) browseAction.run();
++                else if (prior != null) prior.onClick(view);
++            });
++            cell.setContentDescription(null);
++            image.setContentDescription(null);
++            cell.setFocusable(false);
++            cell.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
++            image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+         }
+ 
+         @Override protected void dispatchDraw(Canvas canvas) {
+@@ -105,36 +129,41 @@
+             return active() && super.dispatchTouchEvent(event);
+         }
+ 
+-        private boolean active() { return image.getDrawable() == cameraDrawable || isCamera(image); }
++        private boolean active() {
++            boolean active = image.getDrawable() == cameraDrawable || isCamera(image);
++            if (showing != active) {
++                showing = active;
++                browse.setVisibility(active ? View.VISIBLE : View.GONE);
++                cell.setFocusable(active ? false : cellFocusable);
++                cell.setImportantForAccessibility(active ? View.IMPORTANT_FOR_ACCESSIBILITY_NO : cellAccessibility);
++                image.setImportantForAccessibility(active ? View.IMPORTANT_FOR_ACCESSIBILITY_NO : imageAccessibility);
++            }
++            return active;
++        }
+ 
+         @Override protected void onMeasure(int widthSpec, int heightSpec) {
+             int width = MeasureSpec.getSize(widthSpec);
+             int height = MeasureSpec.getSize(heightSpec);
+             setMeasuredDimension(width, height);
+-            camera.measure(MeasureSpec.makeMeasureSpec(width / 2, MeasureSpec.EXACTLY),
++            browse.measure(MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+                     MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY));
+-            browse.measure(MeasureSpec.makeMeasureSpec(width - width / 2, MeasureSpec.EXACTLY),
+-                    MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY));
+         }
+ 
+         @Override protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+             int width = right - left;
+             int height = bottom - top;
+-            camera.layout(0, 0, width / 2, height);
+-            browse.layout(width / 2, 0, width, height);
++            browse.layout(0, 0, width, height);
+         }
+     }
+ 
+     static final class Action extends View {
+-        private final boolean file;
+-        private final String label;
+         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final Path folder = new Path();
+ 
+-        Action(android.content.Context context, String label, boolean file, Runnable action) {
++        Action(android.content.Context context, Runnable action) {
+             super(context);
+-            this.label = label;
+-            this.file = file;
+-            setContentDescription(file ? "Browse Mac files" : "Camera");
++            setContentDescription("Browse Mac files");
++            setFocusable(true);
+             setBackgroundColor(0xff262a30);
+             setOnClickListener(view -> action.run());
+         }
+@@ -143,27 +172,28 @@
+             super.onDraw(canvas);
+             float width = getWidth(), height = getHeight();
+             float density = getContext() == null ? 1f : getResources().getDisplayMetrics().density;
+-            float cx = width / 2f, cy = height * .43f;
+-            float radius = 11f * density;
++            float cx = width / 2f, cy = height * .4f;
+             paint.setColor(0xfff8f9f9);
+             paint.setStyle(Paint.Style.STROKE);
+             paint.setStrokeWidth(2f * density);
+-            if (file) {
+-                canvas.drawRoundRect(cx - radius * .7f, cy - radius,
+-                        cx + radius * .7f, cy + radius, 2f * density, 2f * density, paint);
+-                canvas.drawLine(cx - radius * .4f, cy + radius * .25f,
+-                        cx + radius * .4f, cy + radius * .25f, paint);
+-            } else {
+-                canvas.drawRoundRect(cx - radius, cy - radius * .65f,
+-                        cx + radius, cy + radius * .65f, 3f * density, 3f * density, paint);
+-                canvas.drawCircle(cx, cy, radius * .32f, paint);
+-                canvas.drawLine(cx - radius * .5f, cy - radius * .65f,
+-                        cx - radius * .3f, cy - radius * .95f, paint);
+-            }
++            folder.reset();
++            folder.moveTo(cx - 13f * density, cy - 7f * density);
++            folder.lineTo(cx - 5f * density, cy - 7f * density);
++            folder.lineTo(cx - 2f * density, cy - 4f * density);
++            folder.lineTo(cx + 11f * density, cy - 4f * density);
++            folder.quadTo(cx + 13f * density, cy - 4f * density, cx + 13f * density, cy - 2f * density);
++            folder.lineTo(cx + 13f * density, cy + 8f * density);
++            folder.quadTo(cx + 13f * density, cy + 10f * density, cx + 11f * density, cy + 10f * density);
++            folder.lineTo(cx - 11f * density, cy + 10f * density);
++            folder.quadTo(cx - 13f * density, cy + 10f * density, cx - 13f * density, cy + 8f * density);
++            folder.close();
++            canvas.drawPath(folder, paint);
++            canvas.drawLine(cx - 13f * density, cy - 2f * density,
++                    cx + 13f * density, cy - 2f * density, paint);
+             paint.setStyle(Paint.Style.FILL);
+             paint.setTextAlign(Paint.Align.CENTER);
+             paint.setTextSize(12f * density);
+-            canvas.drawText(label, cx, height * .7f, paint);
++            canvas.drawText("Browse", cx, cy + 27f * density, paint);
+         }
+     }
+ }

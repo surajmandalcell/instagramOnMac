@@ -1,0 +1,41 @@
+--- a/runtime/java/com/macapk/loader/Boot.java
++++ b/runtime/java/com/macapk/loader/Boot.java
+@@ -3257,6 +3257,8 @@
+             }
+         }
+         System.setProperty("macapk.guestVulkan", on ? "1" : "0");
++        int policyError = NativeOs.publishGuestVulkanPolicy(on);
++        if (policyError != 0) throw new IllegalStateException("Cannot publish guest Vulkan policy: " + policyError);
+         if (on) NativeLog.i(TAG, "guest Vulkan: on for this app (MoltenVK; MACAPK_GUEST_VULKAN="
+             + (env == null ? "auto" : env) + ")");
+     }
+--- a/runtime/java/com/macapk/loader/NativeOs.java
++++ b/runtime/java/com/macapk/loader/NativeOs.java
+@@ -44,4 +44,6 @@
+     public static native int    setenv(String name, String value, boolean overwrite); // 0, else -errno
+     public static native String getenv(String name);                    // value, or null
+     public static native int    unsetenv(String name);                  // 0, else -errno
++    /** Publish the resolved launch policy to the host before any guest library loads. */
++    public static native int publishGuestVulkanPolicy(boolean enabled); // 0, else -errno
+ }
+--- a/runtime/src/native_os.cpp
++++ b/runtime/src/native_os.cpp
+@@ -321,6 +321,10 @@
+     return fns.set ? &fns : nullptr;
+ }
+ 
++jint NativeOs_publishGuestVulkanPolicy(JNIEnv*, jclass, jboolean enabled) {
++    return ::setenv("MACAPK_GUEST_VULKAN", enabled ? "1" : "0", 1) == 0 ? 0 : -errno;
++}
++
+ jint NativeOs_setenv(JNIEnv* env, jclass, jstring name, jstring value, jboolean overwrite) {
+     if (name == nullptr || value == nullptr) return -EINVAL;
+     const char* n = env->GetStringUTFChars(name, nullptr);
+@@ -482,6 +486,7 @@
+ }
+ 
+ const JNINativeMethod kNativeOsMethods[] = {
++    {(char*)"publishGuestVulkanPolicy", (char*)"(Z)I", (void*)NativeOs_publishGuestVulkanPolicy},
+     {(char*)"mediaFileAvailable", (char*)"(Ljava/lang/String;)Z", (void*)NativeOs_mediaFileAvailable},
+     {(char*)"xzDecompress", (char*)"([B)[B",          (void*)NativeOs_xzDecompress},
+     {(char*)"open",        (char*)"(Ljava/lang/String;II)I", (void*)NativeOs_open},

@@ -1,0 +1,34 @@
+--- a/runtime/java/com/macapk/loader/InstagramModeBarCompat.java
++++ b/runtime/java/com/macapk/loader/InstagramModeBarCompat.java
+@@ -39,17 +39,21 @@
+         if (originals == null || originals.length != MODES.length) return null;
+         for (TextView label : originals) if (label == null) return null;
+         ModeBar bar = new ModeBar(selector, originals);
+-        selector.addView(bar, new FrameLayout.LayoutParams(-1, -1));
++        // A match-parent overlay makes the wrap-content selector fill the gallery.
++        int height = Math.max(1, Math.round(48 * selector.getResources().getDisplayMetrics().density));
++        selector.addView(bar, new FrameLayout.LayoutParams(-1, height, Gravity.BOTTOM));
+         return bar;
+     }
+ 
+     static final class ModeBar extends android.view.ViewGroup {
+         final TextView[] originals;
+         final TextView[] buttons = new TextView[MODES.length];
++        final int compactHeight;
+ 
+         ModeBar(FrameLayout selector, TextView[] originals) {
+             super(selector.getContext());
+             this.originals = originals;
++            compactHeight = Math.max(1, Math.round(48 * selector.getResources().getDisplayMetrics().density));
+             setBackgroundColor(0xff191c1f);
+             for (int i = 0; i < buttons.length; i++) {
+                 final int index = i;
+@@ -82,7 +86,7 @@
+ 
+         @Override protected void onMeasure(int widthSpec, int heightSpec) {
+             int width = MeasureSpec.getSize(widthSpec);
+-            int height = MeasureSpec.getSize(heightSpec);
++            int height = resolveSize(compactHeight, heightSpec);
+             setMeasuredDimension(width, height);
+             for (int i = 0; i < buttons.length; i++) {
+                 int start = width * i / buttons.length;

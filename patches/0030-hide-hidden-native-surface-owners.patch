@@ -1,0 +1,69 @@
+--- a/runtime/java/android/view/SurfaceView.java
++++ b/runtime/java/android/view/SurfaceView.java
+@@ -1759,7 +1759,8 @@
+      *  the legacy slot above the whole window; 1 = below the window
+      *  (APPLICATION_MEDIA_SUBLAYER / MEDIA_OVERLAY), its owner punches the hole --
+      *  also the answer once the owner is gone (nothing of a destroyed surface is
+-     *  visible, as on AOSP); 2 = above its own window (setZOrderOnTop(true),
++     *  visible, as on AOSP); -1 = the owning view is hidden or detached;
++     *  2 = above its own window (setZOrderOnTop(true),
+      *  APPLICATION_PANEL_SUBLAYER) but still below other windows.
+      *  cocoa_bridge.mm macapk_guest_layer_z_for maps the answer to a zPosition. */
+     public static int macapkNativeWindowLayerZ() {
+@@ -1767,6 +1768,7 @@
+         java.lang.ref.WeakReference<SurfaceView> ref = sNativeWindowOwner;
+         SurfaceView v = ref != null ? ref.get() : null;
+         if (v == null) return sHadNativeWindowOwner ? 1 : 0;
++        if (!v.macapkAttached || !v.isShown()) return -1;
+         return v.mZOrderOnTop ? 2 : 1;
+     }
+ 
+--- a/runtime/src/cocoa_bridge.mm
++++ b/runtime/src/cocoa_bridge.mm
+@@ -1250,6 +1250,7 @@
+ static inline bool macapk_sv_guest_below_enabled(const char* e) {
+     return !(e && e[0] == '0' && e[1] == '\0');
+ }
++static inline bool macapk_guest_layer_owner_visible(int answer) { return answer >= 0; }
+ // answer: 0 = no owning SurfaceView ever known (or MACAPK_SV_GUEST_BELOW=0),
+ //         1 = below its window, 2 = setZOrderOnTop(true).
+ // overlayZ: the zPosition of the LIVE canvas overlay (the app's View tree) when it
+@@ -1772,7 +1773,7 @@
+     }
+     [CATransaction begin];
+     [CATransaction setDisableActions:YES];
+-    ul.hidden = NO;
++    ul.hidden = !macapk_guest_layer_owner_visible(g_guest_layer_z_answer.load(std::memory_order_relaxed));
+     [CATransaction commit];
+ }
+ 
+@@ -1968,6 +1969,13 @@
+     CAMetalLayer* ul = g_unity_layer;
+     MTKView* av = g_active_render_view;
+     if (!ul || !av) return;
++    if (!macapk_guest_layer_owner_visible(g_guest_layer_z_answer.load(std::memory_order_relaxed))) {
++        [CATransaction begin];
++        [CATransaction setDisableActions:YES];
++        ul.hidden = YES;
++        [CATransaction commit];
++        return;
++    }
+     // v1.0.1079, GATED OFF (MACAPK_EGL_LAYER_IDLE_HIDE=1): do not re-assert an
+     // IDLE guest layer over content that IS being drawn.
+     //
+@@ -8331,11 +8339,13 @@
+     if (env->ExceptionCheck()) { env->ExceptionClear(); return; }
+     g_guest_layer_z_answer.store((int) answer, std::memory_order_relaxed);
+     // Ordered against the LIVE canvas overlay when it shares this layer's superlayer.
+-    const double z = macapk_guest_layer_z((int) answer, ul.superlayer);
+-    if (ul.zPosition == z) return;
++    const bool hidden = !macapk_guest_layer_owner_visible((int) answer);
++    const double z = hidden ? ul.zPosition : macapk_guest_layer_z((int) answer, ul.superlayer);
++    if (ul.zPosition == z && ul.hidden == hidden) return;
+     [CATransaction begin];
+     [CATransaction setDisableActions:YES];   // no implicit 0.25 s zPosition animation
+     ul.zPosition = z;
++    ul.hidden = hidden;
+     [CATransaction commit];
+     std::fprintf(stderr,
+         "[I] cocoa_v2: native-EGL window layer zPos=%g (%s; MACAPK_SV_GUEST_BELOW)\n",

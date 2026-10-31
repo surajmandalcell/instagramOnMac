@@ -1,0 +1,82 @@
+--- a/runtime/java/android/view/View.java
++++ b/runtime/java/android/view/View.java
+@@ -1872,6 +1872,14 @@
+         macapkTraceComposeAttach("ATTACH", macapkAttached);
+         if (macapkAttached) return;
+         macapkAttached = true;
++        synchronized (this) {
++            mAnimationChoreographer = Choreographer.getInstance();
++            if (mDetachedAnimationPosts != null) {
++                for (AnimationPost action : mDetachedAnimationPosts)
++                    mAnimationChoreographer.postCallbackDelayed(Choreographer.CALLBACK_ANIMATION, action.action, null, action.delay);
++                mDetachedAnimationPosts.clear();
++            }
++        }
+         com.macapk.loader.InstagramProfileChipCompat.apply(this);
+         com.macapk.loader.InstagramGalleryCompat.apply(this);
+         com.macapk.loader.InstagramModeBarCompat.apply(this);
+@@ -2039,7 +2047,7 @@
+                 } catch (Throwable ignored) {}
+             }
+         }
+-        macapkAttached = false;
++        synchronized (this) { macapkAttached = false; }
+         try { onDetachedFromWindow(); } catch (Throwable ignored) {}
+         if (attachStateChangeListeners != null) {
+             for (OnAttachStateChangeListener l :
+@@ -6090,19 +6098,34 @@
+      *  which is what actually makes it cancel anything. */
+     public boolean removeCallbacks(Runnable r) {
+         macapkPostHandler().removeCallbacks(r);
++        synchronized (this) {
++            if (r != null && mAnimationChoreographer != null)
++                mAnimationChoreographer.removeCallbacks(Choreographer.CALLBACK_ANIMATION, r, null);
++            if (mDetachedAnimationPosts != null) mDetachedAnimationPosts.removeIf(action -> action.action == r);
++        }
+         macapkForgetScheduled(r);
+         return true;
+     }
+-    /** API-16+: same scheduling guarantees as `post`, but the runnable
+-     *  runs synchronized with the next animation frame. We don't have
+-     *  a Choreographer, so we just defer to `post` which schedules
+-     *  through Handler.post. Used by AppCompat's ContentFrameLayout
+-     *  to defer fitSystemWindows until after layout. */
+-    /** AOSP signature: `public void postOnAnimation(Runnable)`. Returns
+-     *  void, NOT boolean -- AppCompat calls it via direct invokevirtual
+-     *  expecting the void signature, so a boolean return would NoSuchMethodError. */
+-    public void postOnAnimation(Runnable r) { post(r); }
+-    public void postOnAnimationDelayed(Runnable r, long d) { postDelayed(r, d); }
++    private Choreographer mAnimationChoreographer;
++    private java.util.ArrayList<AnimationPost> mDetachedAnimationPosts;
++    private static final class AnimationPost {
++        final Runnable action;
++        final long delay;
++        AnimationPost(Runnable action, long delay) { this.action = action; this.delay = delay; }
++    }
++    /** Frame work belongs to the attached view's owner, never the posting worker. */
++    public void postOnAnimation(Runnable r) { postOnAnimationDelayed(r, 0); }
++    public void postOnAnimationDelayed(Runnable r, long delay) {
++        if (r == null) return;
++        synchronized (this) {
++            if (macapkAttached && mAnimationChoreographer != null) {
++                mAnimationChoreographer.postCallbackDelayed(Choreographer.CALLBACK_ANIMATION, r, null, Math.max(0L, delay));
++            } else {
++                if (mDetachedAnimationPosts == null) mDetachedAnimationPosts = new java.util.ArrayList<>();
++                mDetachedAnimationPosts.add(new AnimationPost(r, Math.max(0L, delay)));
++            }
++        }
++    }
+ 
+     /** API-21+ View.getOutlineProvider / setOutlineProvider. Material
+      *  AppBarLayout sets/checks the outline provider for its elevation
+--- a/runtime/java/android/view/Choreographer.java
++++ b/runtime/java/android/view/Choreographer.java
+@@ -469,6 +469,8 @@
+             synchronized (sMainQueue) {
+                 sMainQueue.removeIf(a -> a.runnable == action && a.type == callbackType);
+             }
++        } else if (action != null) {
++            mHandler.removeCallbacks(action);
+         }
+     }
+ 
